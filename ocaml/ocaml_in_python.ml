@@ -1757,7 +1757,7 @@ let add_variant_type_info ocaml_env expansions python_module (type_info : type_i
                         Metapp.Pat.var (Printf.sprintf "f%d" i)))] in
               let destruct_pat =
                 Metapp.Pat.construct (Lident cstr.name) destruct_args in
-              let destruct body =
+              let destruct destruct_pat body =
                 match constructors with
                 | [_] -> [%expr
                     match capsule with [%p destruct_pat] -> [%e body]]
@@ -1794,7 +1794,7 @@ let add_variant_type_info ocaml_env expansions python_module (type_info : type_i
                   "getitem", Py.Callable.of_function_as_tuple (fun tuple ->
                     let capsule = snd [%e capsule_var]
                       (Py.Tuple.get tuple 0) in
-                    [%e destruct (
+                    [%e destruct destruct_pat (
                         Ppxlib.Ast_helper.Exp.match_
                           [%expr Py.Int.to_int (Py.Tuple.get tuple 1)]
                           ((cstr.args |> ConstructorArgs.to_list_mapi (fun i (_ty, (converter : Ocaml_in_python_api.value_converter)) ->
@@ -1816,9 +1816,8 @@ let add_variant_type_info ocaml_env expansions python_module (type_info : type_i
                     | Record labels -> [%expr
                         let capsule = snd [%e capsule_var]
                           (Py.Tuple.get tuple 0) in
-                        match capsule with
-                        | [%p Metapp.Pat.construct (Lident cstr.name)
-                            [[%pat? r]]] -> [%e
+                        [%e destruct (Metapp.Pat.construct (Lident cstr.name)
+                              [[%pat? r]]) (
                             Ppxlib.Ast_helper.Exp.match_
                               [%expr Py.Int.to_int (Py.Tuple.get tuple 1)]
                                 ((labels |> List.mapi (fun i (info : _ LabelInfo.t) ->
@@ -1840,8 +1839,7 @@ let add_variant_type_info ocaml_env expansions python_module (type_info : type_i
                                [Ppxlib.Ast_helper.Exp.case [%pat? index] [%expr
                                  Ocaml_in_python_api.raise_index_out_of_bounds ~index
                                    ~length:[%e Metapp.Exp.of_int
-                                     (List.length labels)]]])]
-                        | _ -> failwith "setitem"]])]]))]];
+                                     (List.length labels)]]]))]]])]]))]];
       let params_indexes =
         List.map Ocaml_in_python_api.Type.to_index params in
       push_structure [%str
@@ -2460,34 +2458,29 @@ let () =
 let initialize_python ocaml_env =
   Py.initialize ();
   let ocaml = Ocaml_in_python_api.get_root_python_module () in
-  Py.Module.set ocaml "require" (Py.Callable.of_function_as_tuple
-    (fun tuple ->
-      catch_compiler_errors (fun () ->
-        let name = Py.String.to_string (Py.Tuple.get tuple 0) in
-        require name;
-        Py.none)));
-  Py.Module.set ocaml "add_dir" (Py.Callable.of_function_as_tuple
-    (fun tuple ->
-      catch_compiler_errors (fun () ->
-        let name = Py.String.to_string (Py.Tuple.get tuple 0) in
-        add_dir name;
-        Py.none)));
-  Py.Module.set ocaml "loadfile" (Py.Callable.of_function_as_tuple
-    (fun tuple ->
-      catch_compiler_errors (fun () ->
-        let name = Py.String.to_string (Py.Tuple.get tuple 0) in
-        Dynlink.loadfile name;
-        Py.none)));
-  Py.Module.set ocaml "debug" (Py.Callable.of_function_as_tuple
-    (fun _tuple ->
-      catch_compiler_errors (fun () ->
-        debug := true;
-        Py.none)));
-  Py.Module.set ocaml "__getattr__" (Py.Callable.of_function_as_tuple
-    (fun tuple ->
-      catch_compiler_errors (fun () ->
-        let name = Py.String.to_string (Py.Tuple.get tuple 0) in
-        import_ocaml_module_in_python ocaml_env Path.Map.empty name)));
+  let register_primitive name f =
+    Py.Module.set ocaml name (Py.Callable.of_function_as_tuple (fun tuple ->
+      catch_compiler_errors (fun () -> f tuple))) in
+  let register_string_primitive name f =
+    register_primitive name (fun tuple ->
+      f (Py.String.to_string (Py.Tuple.get tuple 0));
+      Py.none) in
+  register_string_primitive "require" require;
+  register_primitive "compile" (fun tuple ->
+    let code = Py.String.to_string (Py.Tuple.get tuple 0) in
+    let module_name = module_name (count Ocaml_in_python_api.capsule_count) in
+    let lexbuf = Lexing.from_string code in
+    let structure = Ppxlib.Parse.implementation lexbuf in
+    compile_and_load_structure ocaml_env module_name structure;
+    import_ocaml_module_in_python ocaml_env Path.Map.empty module_name);
+  register_string_primitive "add_dir" add_dir;
+  register_string_primitive "loadfile" Dynlink.loadfile;
+  register_primitive "debug" (fun _tuple ->
+    debug := true;
+    Py.none);
+  register_primitive "__getattr__" (fun tuple ->
+    let name = Py.String.to_string (Py.Tuple.get tuple 0) in
+    import_ocaml_module_in_python ocaml_env Path.Map.empty name);
   let list = Py.Module.get ocaml "list" in
   Py.Object.set_attr_string list "_api_for_type"
     (Py.Callable.of_function_as_tuple (fun tuple ->

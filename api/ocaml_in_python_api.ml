@@ -203,7 +203,7 @@ module Type = struct
 
   let rec to_core_type (ty : t) : Ppxlib.Parsetree.core_type =
     match ty with
-    | Any -> [%type: _]
+    | Any -> [%type: Py.Object.t]
     | Var  _ -> assert false
     | Arrow ({ label; ty }, r) ->
         Ppxlib.Ast_helper.Typ.arrow label (to_core_type ty) (to_core_type r)
