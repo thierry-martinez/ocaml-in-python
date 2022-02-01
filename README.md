@@ -31,7 +31,7 @@ It is worth noticing that there is no need for type annotations:
 bindings are generated with respect to the interface obtained
 by type inference.
 
-In the following example, we will call the library
+- In the following example, we will call the library
 [`parmap`](https://github.com/rdicosmo/parmap) from Python.
 
 ```python
