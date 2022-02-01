@@ -4,7 +4,7 @@ This library exposes any OCaml module as a Python module, generating
 bindings on the fly.
 
 In the following example, we will call the library
-(`parmap`)[https://github.com/rdicosmo/parmap] from Python.
+[`parmap`](https://github.com/rdicosmo/parmap) from Python.
 
 ```
 import ocaml
@@ -21,7 +21,7 @@ print(Parmap.parmap(
 
 This example uses `ocaml.require`, which relies on the fact
 that `parmap` is available *via*
-(`ocamlfind`)[https://github.com/ocaml/ocamlfind].
+[`ocamlfind`](https://github.com/ocaml/ocamlfind).
 `Parmap.A` is one of the two constructors of the type `Parmap.sequence`.
 `Parmap.parmap` is polymorphic with two type parameters `'a`
 (the type of the inputs) and `'b` (the type of the outputs).
