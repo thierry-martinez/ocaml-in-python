@@ -1,0 +1,11 @@
+(library
+  (name dict))
+
+(rule
+  (alias runtest)
+  (deps dict.py dict.cmxs
+     ../../ocaml/ocaml_in_python.so
+     ../../ocaml/__init__.py)
+  (action
+   (setenv PYTHONPATH %{workspace_root}:%{env:PYTHONPATH=}
+    (run python dict.py))))

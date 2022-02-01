@@ -1,0 +1,5 @@
+post-messages: "\
+If you have not yet done so, please add the following definition to your
+environment:
+  export PYTHONPATH=\"%{share}%/python/:$PYTHONPATH\"
+" {success}

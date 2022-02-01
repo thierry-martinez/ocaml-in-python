@@ -1,0 +1,11 @@
+(library
+  (name extension_constructors))
+
+(rule
+  (alias runtest)
+  (deps extension_constructors.py extension_constructors.cmxs
+     ../../ocaml/ocaml_in_python.so
+     ../../ocaml/__init__.py)
+  (action
+   (setenv PYTHONPATH %{workspace_root}:%{env:PYTHONPATH=}
+    (run python extension_constructors.py))))

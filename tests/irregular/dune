@@ -1,0 +1,11 @@
+(library
+  (name irregular))
+
+(rule
+  (alias runtest)
+  (deps irregular.py irregular.cmxs
+     ../../ocaml/ocaml_in_python.so
+     ../../ocaml/__init__.py)
+  (action
+   (setenv PYTHONPATH %{workspace_root}:%{env:PYTHONPATH=}
+    (run python irregular.py))))

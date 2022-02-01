@@ -1,0 +1,13 @@
+(executable
+  (name ocaml_in_python)
+  (preprocess (pps metapp.ppx metaquot.ppx))
+  (modes (native shared_object))
+  (flags :standard -linkall)
+  (libraries
+    pyml findlib.dynload compiler-libs.optcomp ppxlib ocaml_in_python_api))
+
+(install
+  (section share_root)
+  (files
+    (__init__.py as python/ocaml/__init__.py)
+    (ocaml_in_python.so as python/ocaml/ocaml_in_python.so)))

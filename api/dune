@@ -1,0 +1,5 @@
+(library
+  (name ocaml_in_python_api)
+  (public_name ocaml-in-python.api)
+  (preprocess (pps metapp.ppx metaquot.ppx))
+  (libraries compiler-libs pyml ppxlib metapp))
