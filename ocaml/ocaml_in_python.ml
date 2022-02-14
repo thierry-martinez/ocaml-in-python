@@ -325,6 +325,11 @@ let import_ocaml_module_in_python ocaml_env (expansions : Path.t Path.Map.t) =
 
 module StringSet = Set.Make (String)
 
+let is_unit_type (ty : Ocaml_in_python_api.Type.t) =
+  match ty with
+  | Constr (path, []) when Path.same path Predef.path_unit -> true
+  | _ -> false
+
 module VentilateParams = struct
   type t = {
       labels : string list;
@@ -340,7 +345,11 @@ module VentilateParams = struct
 
   let add (accu : t) (param : Ocaml_in_python_api.Type.param) =
     match param.label with
-    | Nolabel -> { accu with no_label_count = succ accu.no_label_count }
+    | Nolabel ->
+        if is_unit_type param.ty then
+          accu
+        else
+          { accu with no_label_count = succ accu.no_label_count }
     | Labelled label ->  { accu with labels = label :: accu.labels }
     | Optional label ->
         { accu with optional_labels = label :: accu.optional_labels }
@@ -358,8 +367,11 @@ let check_arguments (arity : Ocaml_in_python_api.Type.arity) =
     let nb_args = Py.Tuple.size args_tuple in
     if nb_args <> [%e Metapp.Exp.of_int params.no_label_count] then
       raise (Py.Err (RuntimeError,
-        Printf.sprintf "%d positional arguments expected but %d given"
-          [%e Metapp.Exp.of_int params.no_label_count] nb_args));
+        Printf.sprintf "%d positional argument%s expected but %d given"
+          [%e Metapp.Exp.of_int params.no_label_count]
+          [%e if params.no_label_count = 1 then Metapp.Exp.of_string ""
+            else Metapp.Exp.of_string "s"]
+          nb_args));
     [%e Metapp.sequence (params.labels |> List.map (fun label ->
        [%expr if keywords_dict = Py.null || Py.Dict.get_item_string keywords_dict [%e Metapp.Exp.of_string label] = None then
          raise (Py.Err (RuntimeError,
@@ -516,10 +528,19 @@ module Type = struct
     | _ ->
         failwith "Not implemented"
 
+  let is_pyobject path =
+    match Path.flatten path with
+    | `Ok (ident, list) -> Ident.name ident = "Pytypes" && list = ["pyobject"]
+    | `Contains_apply -> false
+
+  let id : Ocaml_in_python_api.value_converter = {
+      ocaml_of_python = Explicit Fun.id;
+      python_of_ocaml = Explicit Fun.id }
+
   let to_value_converter_impl ?name ocaml_env expansions (ty : t) : Ocaml_in_python_api.value_converter =
     match ty with
-    | Any -> {
-        ocaml_of_python = Explicit Fun.id; python_of_ocaml = Explicit Fun.id }
+    | Any -> id
+    | Constr (path, []) when is_pyobject path -> id
     | Var _ -> assert false
     | Arrow _ ->
         value_converter_of_function ?name ocaml_env expansions (arity_of_type ty)
@@ -557,20 +578,18 @@ module Type = struct
       match param.label with
       | Nolabel ->
           let arg_converter = to_value_converter ocaml_env expansions param.ty in
-          begin match param.ty with
-          | Constr (path, []) when path = Predef.path_unit ->
-              (index, python_args, python_dict),
-              ((Nolabel, [%pat? ()]), (Nolabel, [%expr ()]))
-          | _ ->
-              let var = Printf.sprintf "x%d" index in
-              let python_args =
-                Ocaml_in_python_api.Function.apply arg_converter.python_of_ocaml
-                  (Metapp.Exp.var var) :: python_args in
-              (index + 1, python_args, python_dict),
-              ((Nolabel, Metapp.Pat.var var),
-                (Nolabel, Ocaml_in_python_api.Function.apply arg_converter.ocaml_of_python
-                  [%expr Py.Tuple.get args_tuple [%e Metapp.Exp.of_int index]]))
-          end
+          if is_unit_type param.ty then
+            (index, python_args, python_dict),
+            ((Nolabel, [%pat? ()]), (Nolabel, [%expr ()]))
+          else
+            let var = Printf.sprintf "x%d" index in
+            let python_args =
+              Ocaml_in_python_api.Function.apply arg_converter.python_of_ocaml
+                (Metapp.Exp.var var) :: python_args in
+            (index + 1, python_args, python_dict),
+            ((Nolabel, Metapp.Pat.var var),
+              (Nolabel, Ocaml_in_python_api.Function.apply arg_converter.ocaml_of_python
+                [%expr Py.Tuple.get args_tuple [%e Metapp.Exp.of_int index]]))
       | Labelled label ->
           let arg_converter = to_value_converter ocaml_env expansions param.ty in
           let python_dict =
@@ -1212,7 +1231,14 @@ let make_class parents fields classname = [%expr
           [%expr ([%e Metapp.Exp.of_string field_name], [%e value])]))]
       [%e Metapp.Exp.of_string classname]]
 
-let push_constructor_class classname class_var_exp get_cstr_name i (cstr : _ Constructor.t) =
+let get_module_name (ident : Longident.t) =
+  match ident with
+  | Ldot (module_name, _str) ->
+      Format.asprintf "%a" Pprintast.longident module_name
+  | _ ->
+      "<unknown>"
+
+let push_constructor_class longident classname class_var_exp get_cstr_name i (cstr : _ Constructor.t) =
   let cstr_name = get_cstr_name cstr.name in
   let classname = Printf.sprintf "%s.%s" classname cstr_name in
   let length = ConstructorArgs.length cstr.args in
@@ -1225,6 +1251,7 @@ let push_constructor_class classname class_var_exp get_cstr_name i (cstr : _ Con
   let field_names =
     make_python_tuple (field_list |> List.map Field.to_field_name) in
   let fields =
+    ("__module__", make_python_string (get_module_name longident)) ::
     ("_constructor_name", make_python_string cstr_name) ::
     ("_constructor_index", make_python_int i) ::
     ("_default_length", make_python_int length) ::
@@ -1275,6 +1302,7 @@ let add_class_prototype (longident : Longident.t)
         let field_names =
           make_python_tuple (field_list |> List.map Field.to_field_name) in
         let fields =
+          ("__module__", make_python_string (get_module_name longident)) ::
           ("_default_length", make_python_int (List.length labels)) ::
           ("_api_for_type", [%expr Py.none]) ::
           ("_field_names", field_names) ::
@@ -1293,13 +1321,14 @@ let add_class_prototype (longident : Longident.t)
         let constructors =
           List.map Constructor.of_constructor_declaration constructors in
         let fields =
-          constructors |>
+          ("__module__", make_python_string (get_module_name longident)) ::
+          (constructors |>
           List.map (fun (cstr : _ Constructor.t) ->
-            cstr.name, [%expr Py.none]) in
+            cstr.name, [%expr Py.none])) in
         push_structure [%str let [%p Metapp.Pat.var (get_local_class_var class_var.local_index)] =
           [%e make_class [variant_class] fields classname]];
         let class_var_exp = Metapp.Exp.var (get_local_class_var class_var.local_index) in
-        List.iteri (push_constructor_class classname class_var_exp Fun.id) constructors;
+        List.iteri (push_constructor_class longident classname class_var_exp Fun.id) constructors;
         Variant constructors
     | Type_open ->
         push_structure [%str let [%p Metapp.Pat.var (get_local_class_var class_var.local_index)] =
@@ -2334,7 +2363,7 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
       let cstr = cstr |> Constructor.map (fun ty ->
         Type.of_type_expr vars ocaml_env expansions ty) in
       let index = Ocaml_in_python_api.ExtensibleArray.push open_type.constructors (Some cstr) in
-      push_constructor_class open_type.name class_var (fun (longident : Longident.t) -> Format.asprintf "%a" Pprintast.longident longident) index cstr;
+      push_constructor_class longident' open_type.name class_var (fun (longident : Longident.t) -> Format.asprintf "%a" Pprintast.longident longident) index cstr;
       push_structure [%str
         Py.Module.set [%e python_module] [%e Metapp.Exp.of_string name]
           [%e Metapp.Exp.var (get_local_class_var cstr.class_var.local_index)]];
