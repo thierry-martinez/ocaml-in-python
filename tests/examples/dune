@@ -1,11 +1,13 @@
-(library
-  (name examples)
-  (libraries parmap))
+;(library
+;  (name examples)
+;  (libraries parmap pyml))
+
 
 (rule
   (alias runtest)
   (deps
-     examples.py examples.cmxs
+     examples.py
+;    examples.cmxs
      ../../ocaml/ocaml_in_python.so
      ../../ocaml/__init__.py)
   (action
