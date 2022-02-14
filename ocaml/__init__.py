@@ -27,6 +27,13 @@ class abstract:
         except KeyError:
             raise RuntimeError("abstract type cannot be constructed")
 
+def print_value(v):
+    """double quote v if v is a string, return str(v) otherwise"""
+    if isinstance(v, str):
+        quoted = v.replace('"', r'\"')
+        return f'"{quoted}"'
+    else:
+        return str(v)
 
 class list(collections.abc.Sequence):
     """ocaml.list"""
@@ -131,16 +138,22 @@ class list(collections.abc.Sequence):
                 index = None
             if index is not None:
                 return self[index]
-        raise IndexError(f"Unknown field {name}")
+        raise AttributeError(f"Unknown field {name}")
+
+    def __repr__(self):
+        return "[" + ",".join([repr(item) for item in self]) + "]"
 
     def __str__(self):
-        return "[" + ",".join([str(item) for item in self]) + "]"
+        return "[" + ";".join([print_value(item) for item in self]) + "]"
 
 class tuple(list):
     """ocaml.tuple"""
 
+    def __repr__(self):
+        return "(" + ",".join([repr(item) for item in self]) + ")"
+
     def __str__(self):
-        return "(" + ",".join([str(item) for item in self]) + ")"
+        return "(" + ",".join([print_value(item) for item in self]) + ")"
 
 class __array_api(__list_api):
     setitem = None
@@ -160,15 +173,23 @@ class array(list):
         else:
             self._api.setitem(self._capsule, index, value)
 
+    def __repr__(self):
+        return "[" + ",".join([repr(item) for item in self]) + "]"
+
     def __str__(self):
-        return "[|" + ",".join([str(item) for item in self]) + "|]"
+        return "[|" + ";".join([print_value(item) for item in self]) + "|]"
 
 class record(array):
     """ocaml.record"""
 
+    def __repr__(self):
+        return "{" + ",".join(
+            [repr(field) + ":" + repr(value)
+                for (field, value) in zip(self._field_names, self)]) + "}"
+
     def __str__(self):
         return "{" + ";".join(
-            [str(field) + "=" + str(value)
+            [str(field) + "=" + print_value(value)
                 for (field, value) in zip(self._field_names, self)]) + "}"
 
 class __ref_api(__array_api):
@@ -184,14 +205,26 @@ class variant(array):
 
     _constructor_name = None
 
+    def __repr__(self):
+        if len(self) == 0:
+            return self._constructor_name
+        elif self._field_names is None:
+            return self._constructor_name + "(" + ",".join(
+                [print_value(item) for item in self]) + ")"
+        else:
+            return (self._constructor_name + "(" + ",".join([
+                str(field) + "=" + repr(value)
+                for (field, value) in zip(self._field_names, self)]) + ")")
+
     def __str__(self):
         if len(self) == 0:
             return self._constructor_name
         elif self._field_names is None:
-            return self._constructor_name + "(" + ",".join([str(item) for item in self]) + ")"
+            return self._constructor_name + "(" + ",".join(
+                [print_value(item) for item in self]) + ")"
         else:
             return (self._constructor_name + " {" + ";".join([
-                str(field) + "=" + str(value)
+                str(field) + "=" + print_value(value)
                 for (field, value) in zip(self._field_names, self)]) + "}")
 
 
@@ -199,6 +232,9 @@ class bytes(array):
     """ocaml.bytes"""
 
     _default_type = []
+
+    def __repr__(self):
+        return repr(self._api.to_string(self._capsule))
 
     def __str__(self):
         return self._api.to_string(self._capsule)
