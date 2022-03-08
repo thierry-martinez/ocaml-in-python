@@ -11,3 +11,10 @@
   (files
     (__init__.py as python/ocaml/__init__.py)
     (ocaml_in_python.so as python/ocaml/ocaml_in_python.so)))
+
+(install
+  (section lib)
+  (files
+    pyproject.toml setup.cfg
+    (__init__.py as ocaml/__init__.py)
+    (ocaml_in_python.so as ocaml/ocaml_in_python.so)))

@@ -1,5 +1,11 @@
 post-messages: "\
-If you have not yet done so, please add the following definition to your
-environment:
-  export PYTHONPATH=\"%{share}%/python/:$PYTHONPATH\"
+You should register the \"ocaml\" package in your Python environment.
+There are two options:
+
+  (1) either you  register the package with \"pip\" using the following
+      command:
+        pip install --editable \"%{lib}%/ocaml-in-python\"
+
+  (2) or you add the following definition to your environment:
+        export PYTHONPATH=\"%{share}%/python/:$PYTHONPATH\"
 " {success}
