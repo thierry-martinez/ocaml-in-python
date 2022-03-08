@@ -8,6 +8,7 @@ int = int
 float = float
 string = str
 bool = bool
+bytes = bytes
 
 def error_this_function_should_be_implemented_in_ocaml():
     raise NotImplementedError("This function should be implemented in OCaml")
@@ -191,14 +192,6 @@ class record(array):
         return "{" + ";".join(
             [str(field) + "=" + print_value(value)
                 for (field, value) in zip(self._field_names, self)]) + "}"
-
-class __ref_api(__array_api):
-    pass
-
-class ref(record):
-    """ocaml.ref"""
-
-    _field_names = ["contents"]
 
 class variant(array):
     """ocaml.variant"""

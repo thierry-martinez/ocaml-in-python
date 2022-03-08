@@ -329,30 +329,37 @@ type 'a api = {
     make : Py.Object.t -> Py.Object.t;
   }
 
-type type_def_info = {
+type 'a type_def_info = {
     make_capsule : TypeList.t -> unit;
     make_api : TypeList.t -> unit;
-    api_table : Py.Object.t api TypeList.Hashtbl.t;
+    api_table : 'a api TypeList.Hashtbl.t;
   }
 
-let type_def_table : type_def_info IntHashtbl.t = IntHashtbl.create 16
+let type_def_table : Py.Object.t type_def_info IntHashtbl.t = IntHashtbl.create 16
 
-type variant_info = {
-    make_capsule : TypeList.t -> unit;
-    make_api : TypeList.t -> unit;
-    api_table : Py.Object.t array api TypeList.Hashtbl.t;
-  }
+let api_for_type type_def_info tuple =
+  let types = Py.Tuple.get tuple 0 in
+  let type_list =
+    try
+      Py.List.to_list_map Type.of_python types
+    with _ ->
+      [Type.of_python types] in
+  let api =
+    try
+      TypeList.Hashtbl.find type_def_info.api_table type_list
+    with Not_found ->
+      type_def_info.make_capsule type_list;
+      type_def_info.make_api type_list;
+      try
+        TypeList.Hashtbl.find type_def_info.api_table type_list
+      with Not_found ->
+        failwith "api_for_type" in
+  api.api
 
-let variant_table : variant_info IntHashtbl.t = IntHashtbl.create 16
+let variant_table : Py.Object.t array type_def_info IntHashtbl.t = IntHashtbl.create 16
 
 module OpenType = struct
-  type info = {
-      make_capsule : TypeList.t -> unit;
-      make_api : TypeList.t -> unit;
-      api_table : Py.Object.t array api TypeList.Hashtbl.t;
-    }
-
-  let table : info IntHashtbl.t = IntHashtbl.create 16
+  let table : Py.Object.t array type_def_info IntHashtbl.t = IntHashtbl.create 16
 end
 
 let capsule_count = ref 0
@@ -417,3 +424,9 @@ module Extension_constructor = struct
 end
 
 let exception_class = ref Py.none
+
+let pending_module_table : Py.Object.t Lazy.t Path.Map.t ref =
+  ref Path.Map.empty
+
+let pending_modules : Py.Object.t Lazy.t ExtensibleArray.t =
+  ExtensibleArray.create (lazy (failwith "not yet available")) 16

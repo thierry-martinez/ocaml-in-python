@@ -388,8 +388,43 @@ let check_arguments (arity : Ocaml_in_python_api.Type.arity) =
          raise (Py.Err (RuntimeError,
            Printf.sprintf "unknown labelled argument '%s'" key)))]
 
-let type_constr_converter_tbl :
-      (Env.t -> Path.t Path.Map.t -> Ocaml_in_python_api.Type.t list -> Ocaml_in_python_api.value_converter) Types.Uid.Tbl.t =
+type lident_or_variable_index =
+  (Longident.t, Ocaml_in_python_api.variable_index) Either.t
+
+type expression_or_variable_index =
+  (Ppxlib.Parsetree.expression, Ocaml_in_python_api.variable_index) Either.t
+
+let get_variable_ident get_local_name (variable_index : Ocaml_in_python_api.variable_index) :
+      Longident.t =
+  let local = get_local_name variable_index.local_index in
+  let current = Option.get !current_module_index in
+  if variable_index.module_index = current then
+    Lident local
+  else
+    Ldot (Lident (module_name variable_index.module_index), local)
+
+let get_variable get_local_name (ident : lident_or_variable_index) =
+  match ident with
+  | Left ident -> [%expr ![%e Metapp.Exp.ident ident]]
+  | Right index -> Metapp.Exp.ident (get_variable_ident get_local_name index)
+
+let get_variable_expression (ident : lident_or_variable_index) :
+  expression_or_variable_index =
+  match ident with
+  | Left ident -> Left [%expr ![%e Metapp.Exp.ident ident]]
+  | Right index -> Right index
+
+let get_variable_as_expression get_local_name (ident : expression_or_variable_index) =
+  match ident with
+  | Left exp -> exp
+  | Right index -> Metapp.Exp.ident (get_variable_ident get_local_name index)
+
+type type_constr_info = {
+    converter : Env.t -> Path.t Path.Map.t -> Ocaml_in_python_api.Type.t list -> Ocaml_in_python_api.value_converter;
+    class_ : expression_or_variable_index;
+  }
+
+let type_constr_converter_tbl : type_constr_info Types.Uid.Tbl.t =
   Types.Uid.Tbl.create 16
 
 let exn_converter_ref = ref (fun _ocaml_env _expansions : Ocaml_in_python_api.value_converter -> {
@@ -439,6 +474,30 @@ let make_ocaml_function_call ocaml_env expansions arity (result_converter : Ocam
       let class_ = Py.Object.find_attr_string obj "__class__" in
       raise (Py.E (class_, obj))]
 
+let rec wake_up_modules (p : Path.t) =
+  match Path.Map.find p !Ocaml_in_python_api.pending_module_table with
+  | l -> ignore (Lazy.force l)
+  | exception Not_found ->
+      match p with
+      | Pdot (p, _) -> wake_up_modules p
+      | _ -> ()
+
+let type_info_of_constr ocaml_env expansions path =
+  wake_up_modules path;
+  let uid = uid_of_type_path ocaml_env path in
+  try
+    Some (Types.Uid.Tbl.find type_constr_converter_tbl uid)
+  with Not_found ->
+    match path with
+    | Pident _ -> None
+    | _ ->
+        ignore (import_ocaml_module_in_python ocaml_env
+          expansions (Ident.name (Path.head path)));
+        try
+          Some (Types.Uid.Tbl.find type_constr_converter_tbl uid)
+        with Not_found ->
+          None
+
 module Type = struct
   include Ocaml_in_python_api.Type
 
@@ -482,18 +541,19 @@ module Type = struct
       index
 
     let bind (vars : t) (ty : Types.type_expr) ty' =
-      Ocaml_in_python_api.IntHashtbl.add vars.table ty.id ty'
+      Ocaml_in_python_api.IntHashtbl.add vars.table (Metapp.Types.get_id ty) ty'
 
     let find (vars : t) (ty : Types.type_expr) =
+      let id = Metapp.Types.get_id ty in
       try
-        Ocaml_in_python_api.IntHashtbl.find vars.table ty.id
+        Ocaml_in_python_api.IntHashtbl.find vars.table id
       with Not_found ->
         let name =
-          match ty.desc with
+          match Metapp.Types.get_desc ty with
           | Tvar name -> name
           | _ -> assert false in
-        let ty' = Var (fresh ?name ~id:ty.id vars) in
-        Ocaml_in_python_api.IntHashtbl.add vars.table ty.id ty';
+        let ty' = Var (fresh ?name ~id vars) in
+        Ocaml_in_python_api.IntHashtbl.add vars.table id ty';
         ty'
   end
 
@@ -507,7 +567,7 @@ module Type = struct
       path
 
   let rec of_type_expr (vars : Vars.t) (ocaml_env : Env.t) expansions (ty : Types.type_expr) : t =
-    match ty.desc with
+    match Metapp.Types.get_desc ty with
     | Tvar _ -> Vars.find vars ty
     | Tarrow (label, param, result, _) ->
         let param = of_type_expr vars ocaml_env expansions param in
@@ -547,27 +607,13 @@ module Type = struct
     | Tuple args ->
         !value_converter_of_tuple ocaml_env expansions args
     | Constr (path, args) ->
-        let uid = uid_of_type_path ocaml_env path in
-        let converter =
-          try
-            Types.Uid.Tbl.find type_constr_converter_tbl uid
-          with Not_found ->
-            match
-              match path with
-              | Pident _ -> None
-              | _ ->
-                  ignore (import_ocaml_module_in_python ocaml_env
-                    expansions (Ident.name (Path.head path)));
-                  try
-                    Some (Types.Uid.Tbl.find type_constr_converter_tbl uid)
-                  with Not_found ->
-                    None
-            with
-            | None ->
-                failwith
-                  (Format.asprintf "No conversion for %a" Path.print path)
-            | Some result -> result in
-        let result = converter ocaml_env expansions args in
+        let type_info =
+          match type_info_of_constr ocaml_env expansions path with
+          | None ->
+              failwith
+                (Format.asprintf "No conversion for %a" Path.print path)
+          | Some type_info -> type_info in
+        let result = type_info.converter ocaml_env expansions args in
         result
 
   let converters_of_arity_impl ocaml_env expansions arity : Ocaml_in_python_api.converters_of_arity =
@@ -691,24 +737,6 @@ let fresh_variable_index counter : Ocaml_in_python_api.variable_index =
 let fresh_capsule_index () =
   fresh_variable_index Ocaml_in_python_api.capsule_count
 
-let get_variable_ident get_local_name (variable_index : Ocaml_in_python_api.variable_index) :
-      Longident.t =
-  let local = get_local_name variable_index.local_index in
-  let current = Option.get !current_module_index in
-  if variable_index.module_index = current then
-    Lident local
-  else
-    Ldot (Lident (module_name variable_index.module_index), local)
-
-type lident_or_variable_index =
-  | LidentRef of Longident.t
-  | VariableIndex of Ocaml_in_python_api.variable_index
-
-let get_variable get_local_name (ident : lident_or_variable_index) =
-  match ident with
-  | LidentRef ident -> [%expr ![%e Metapp.Exp.ident ident]]
-  | VariableIndex index -> Metapp.Exp.ident (get_variable_ident get_local_name index)
-
 let capsule_ident variable_index =
   get_variable_ident local_capsule_name variable_index
 
@@ -787,7 +815,7 @@ let find_tuple_capsule ocaml_env expansions (types : Type.t list) :
         [%expr Ocaml_in_python_api.Type.of_index
           [%e Metapp.Exp.of_int type_index]])) in
     push_capsule_declaration capsule_name
-      [%expr Format.asprintf "ocaml.tuple[%a]"
+      [%expr Format.asprintf "%a"
         Ocaml_in_python_api.Type.format
           (Ocaml_in_python_api.Type.Tuple [%e types_exp])] core_type;
     let structure = [%str
@@ -849,8 +877,11 @@ let find_tuple_api ocaml_env expansions (types : Type.t list) : Py.Object.t =
       types
   with Not_found ->
     ignore (find_tuple_capsule ocaml_env expansions types);
-    Ocaml_in_python_api.TypeList.Hashtbl.find Ocaml_in_python_api.tuple_api
-      types
+    try
+      Ocaml_in_python_api.TypeList.Hashtbl.find Ocaml_in_python_api.tuple_api
+        types
+    with Not_found ->
+      assert false
 
 let make_bytes_api _ocaml_env _expansions : Py.Object.t =
   Py.Class.init "bytes" ~methods:[
@@ -907,8 +938,11 @@ let value_converter_of_tuple ocaml_env expansions (types : Type.t list) : Ocaml_
           let capsule =
             if capsule = Py.none then
               let api =
-                Ocaml_in_python_api.TypeList.Hashtbl.find
-                  Ocaml_in_python_api.tuple_api [%e types] in
+                try
+                  Ocaml_in_python_api.TypeList.Hashtbl.find
+                    Ocaml_in_python_api.tuple_api [%e types]
+                with Not_found ->
+                  failwith "tuple_api" in
               Py.Callable.to_function_as_tuple
                 (Py.Object.find_attr_string [%e v] "_set_api")
                 [%e make_python_tuple [v; [%expr api]]]
@@ -924,8 +958,11 @@ let value_converter_of_tuple ocaml_env expansions (types : Type.t list) : Ocaml_
     Explicit (fun v -> [%expr
       let capsule = fst [%e Metapp.Exp.ident capsule] [%e v] in
       let api =
-        Ocaml_in_python_api.TypeList.Hashtbl.find
-          Ocaml_in_python_api.tuple_api [%e types] in
+        try
+          Ocaml_in_python_api.TypeList.Hashtbl.find
+            Ocaml_in_python_api.tuple_api [%e types]
+        with Not_found ->
+          failwith "tuple_api" in
       Py.Callable.to_function_as_tuple_and_dict
         (Py.Object.find_attr_string
           (Ocaml_in_python_api.get_root_python_module ()) "tuple")
@@ -1051,7 +1088,10 @@ let find_collection_api collection_api ocaml_env expansions (ty : Type.t) : Py.O
     Type.Hashtbl.find collection_api.api_table ty
   with Not_found ->
     ignore (find_collection_capsule collection_api ocaml_env expansions ty);
-    Type.Hashtbl.find collection_api.api_table ty
+    try
+      Type.Hashtbl.find collection_api.api_table ty
+    with Not_found ->
+      failwith "find_collection_api"
 
 let value_converter_of_array ocaml_env expansions (arg : Type.t) : Ocaml_in_python_api.value_converter =
   let arg_converter = Type.to_value_converter ocaml_env expansions arg in
@@ -1067,10 +1107,13 @@ let value_converter_of_array ocaml_env expansions (arg : Type.t) : Ocaml_in_pyth
           let capsule =
             if capsule = Py.none then
               let api =
-                Ocaml_in_python_api.Type.Hashtbl.find
-                  Ocaml_in_python_api.array_api
-                  (Ocaml_in_python_api.Type.of_index
-                    [%e Metapp.Exp.of_int type_index]) in
+                try
+                  Ocaml_in_python_api.Type.Hashtbl.find
+                    Ocaml_in_python_api.array_api
+                    (Ocaml_in_python_api.Type.of_index
+                      [%e Metapp.Exp.of_int type_index])
+                with Not_found ->
+                  failwith "value_converter_of_array" in
               Py.Callable.to_function_as_tuple
                 (Py.Object.find_attr_string [%e v] "_set_api")
                 [%e make_python_tuple [v; [%expr api]]]
@@ -1086,10 +1129,13 @@ let value_converter_of_array ocaml_env expansions (arg : Type.t) : Ocaml_in_pyth
       let array = [%e v] in
       let capsule = fst [%e Metapp.Exp.ident capsule] array in
       let api =
-        Ocaml_in_python_api.Type.Hashtbl.find
-          Ocaml_in_python_api.array_api
-          (Ocaml_in_python_api.Type.of_index
-            [%e Metapp.Exp.of_int type_index]) in
+        try
+          Ocaml_in_python_api.Type.Hashtbl.find
+            Ocaml_in_python_api.array_api
+            (Ocaml_in_python_api.Type.of_index
+               [%e Metapp.Exp.of_int type_index])
+        with Not_found ->
+          failwith "value_converter_of_array" in
       let result = Py.Callable.to_function_as_tuple_and_dict
         (Py.Object.find_attr_string
           (Ocaml_in_python_api.get_root_python_module ()) "array")
@@ -1115,10 +1161,13 @@ let value_converter_of_list ocaml_env expansions (arg : Type.t) : Ocaml_in_pytho
       let array = Array.of_list [%e v] in
       let capsule = fst [%e Metapp.Exp.ident capsule ] array in
       let api =
-        Ocaml_in_python_api.Type.Hashtbl.find
-          Ocaml_in_python_api.list_api
-          (Ocaml_in_python_api.Type.of_index
-            [%e Metapp.Exp.of_int type_index]) in
+        try
+          Ocaml_in_python_api.Type.Hashtbl.find
+            Ocaml_in_python_api.list_api
+            (Ocaml_in_python_api.Type.of_index
+               [%e Metapp.Exp.of_int type_index])
+        with Not_found ->
+          failwith "value_converter_of_list" in
       let result = Py.Callable.to_function_as_tuple_and_dict
         (Py.Object.find_attr_string
           (Ocaml_in_python_api.get_root_python_module ()) "list")
@@ -1238,9 +1287,8 @@ let get_module_name (ident : Longident.t) =
   | _ ->
       "<unknown>"
 
-let push_constructor_class longident classname class_var_exp get_cstr_name i (cstr : _ Constructor.t) =
+let push_constructor_class longident class_var_exp get_cstr_name i (cstr : _ Constructor.t) =
   let cstr_name = get_cstr_name cstr.name in
-  let classname = Printf.sprintf "%s.%s" classname cstr_name in
   let length = ConstructorArgs.length cstr.args in
   let field_list =
     match cstr.args with
@@ -1251,7 +1299,7 @@ let push_constructor_class longident classname class_var_exp get_cstr_name i (cs
   let field_names =
     make_python_tuple (field_list |> List.map Field.to_field_name) in
   let fields =
-    ("__module__", make_python_string (get_module_name longident)) ::
+    ("__module__", make_python_string ("ocaml." ^ get_module_name longident)) ::
     ("_constructor_name", make_python_string cstr_name) ::
     ("_constructor_index", make_python_int i) ::
     ("_default_length", make_python_int length) ::
@@ -1263,7 +1311,7 @@ let push_constructor_class longident classname class_var_exp get_cstr_name i (cs
     List.map Field.to_field field_list in
   push_structure [%str
     let [%p Metapp.Pat.var (get_local_class_var cstr.class_var.local_index)] = [%e
-      make_class [class_var_exp] fields classname]
+      make_class [class_var_exp] fields cstr_name]
     let () =
       Py.Object.set_attr_string [%e class_var_exp]
         [%e Metapp.Exp.of_string cstr_name]
@@ -1278,8 +1326,6 @@ let add_class_prototype (longident : Longident.t)
   let index = count type_count in
   let name = Ident.name ident in
   let longident = Longident.Ldot (longident, name) in
-  let classname =
-    Format.asprintf "ocaml.%a" Pprintast.longident longident in
   let class_var = fresh_variable_index class_count in
   let nb_params = List.length type_declaration.type_params in
   let monomorphic = nb_params = 0 in
@@ -1291,7 +1337,7 @@ let add_class_prototype (longident : Longident.t)
           Py.Module.get (Ocaml_in_python_api.get_root_python_module ())
             "abstract"] in
         push_structure [%str let [%p Metapp.Pat.var (get_local_class_var class_var.local_index)] =
-          [%e make_class [abstract_class] [] classname]];
+          [%e make_class [abstract_class] [] name]];
         Abstract
     | Type_record (labels, _) ->
         let labels = List.map LabelInfo.of_declaration labels in
@@ -1302,7 +1348,7 @@ let add_class_prototype (longident : Longident.t)
         let field_names =
           make_python_tuple (field_list |> List.map Field.to_field_name) in
         let fields =
-          ("__module__", make_python_string (get_module_name longident)) ::
+          ("__module__", make_python_string ("ocaml." ^ get_module_name longident)) ::
           ("_default_length", make_python_int (List.length labels)) ::
           ("_api_for_type", [%expr Py.none]) ::
           ("_field_names", field_names) ::
@@ -1315,30 +1361,30 @@ let add_class_prototype (longident : Longident.t)
             fields in
         push_structure
           [%str let [%p Metapp.Pat.var (get_local_class_var class_var.local_index)] =
-            [%e make_class [record_class] fields classname]];
+            [%e make_class [record_class] fields name]];
         Record labels
     | Type_variant (constructors, _) ->
         let constructors =
           List.map Constructor.of_constructor_declaration constructors in
         let fields =
-          ("__module__", make_python_string (get_module_name longident)) ::
+          ("__module__", make_python_string ("ocaml." ^ get_module_name longident)) ::
           (constructors |>
           List.map (fun (cstr : _ Constructor.t) ->
             cstr.name, [%expr Py.none])) in
         push_structure [%str let [%p Metapp.Pat.var (get_local_class_var class_var.local_index)] =
-          [%e make_class [variant_class] fields classname]];
+          [%e make_class [variant_class] fields name]];
         let class_var_exp = Metapp.Exp.var (get_local_class_var class_var.local_index) in
-        List.iteri (push_constructor_class longident classname class_var_exp Fun.id) constructors;
+        List.iteri (push_constructor_class longident class_var_exp Fun.id) constructors;
         Variant constructors
     | Type_open ->
         push_structure [%str let [%p Metapp.Pat.var (get_local_class_var class_var.local_index)] =
-          [%e make_class [variant_class] [] classname]];
+          [%e make_class [variant_class] [] name]];
         let constructors =
           Ocaml_in_python_api.ExtensibleArray.create None 16 in
         Types.Uid.Tbl.add open_types_tbl type_declaration.type_uid {
-          constructors; name; class_var = VariableIndex class_var; index };
+          constructors; name; class_var = Right class_var; index };
         Open constructors in
-  { index; name; longident; class_var = VariableIndex class_var; capsule_var; kind; type_declaration }
+  { index; name; longident; class_var = Right class_var; capsule_var; kind; type_declaration }
 
 let get_local_capsule_var index =
   Format.asprintf "capsule%d" index
@@ -1352,6 +1398,15 @@ let python_of_ocaml index =
 
 let ocaml_of_python index =
   Printf.sprintf "ocaml_of_python%d" index
+
+let check_arity (type_info : type_info) params =
+  let nb_args = List.length params in
+  if nb_args <> type_info.type_declaration.type_arity then
+    raise (Py.Err (TypeError,
+      Format.asprintf "%a expect %d argument(s) but %d given"
+        Pprintast.longident type_info.longident
+        type_info.type_declaration.type_arity
+        nb_args))
 
 let make_type_converter (type_info : type_info) ocaml_env expansions params :
   Ocaml_in_python_api.value_converter =
@@ -1385,16 +1440,24 @@ let make_type_converter (type_info : type_info) ocaml_env expansions params :
                   Py.Tuple.empty (Py.Dict.singleton_string "__capsule" capsule)]
             | Record _ -> [%expr
                 let type_def_info =
-                  Ocaml_in_python_api.IntHashtbl.find
-                    Ocaml_in_python_api.type_def_table
-                    [%e Metapp.Exp.of_int type_info.index] in
+                  try
+                    Ocaml_in_python_api.IntHashtbl.find
+                      Ocaml_in_python_api.type_def_table
+                      [%e Metapp.Exp.of_int type_info.index]
+                  with Not_found ->
+                    failwith "make_type_converter" in
                 let types =
                   List.map Ocaml_in_python_api.Type.of_index
                     [%e Metapp.Exp.list
                       (List.map Metapp.Exp.of_int params_indexes)] in
                 type_def_info.make_api types;
-                (Ocaml_in_python_api.TypeList.Hashtbl.find
-                  type_def_info.api_table types).make]
+                let api =
+                  try
+                    Ocaml_in_python_api.TypeList.Hashtbl.find
+                      type_def_info.api_table types
+                  with Not_found ->
+                    failwith "make_type_converter" in
+                api.make]
             | Variant _ -> [%expr
                 let type_def_info =
                   Ocaml_in_python_api.IntHashtbl.find
@@ -1405,8 +1468,13 @@ let make_type_converter (type_info : type_info) ocaml_env expansions params :
                     [%e Metapp.Exp.list
                       (List.map Metapp.Exp.of_int params_indexes)] in
                 type_def_info.make_api types;
-                (Ocaml_in_python_api.TypeList.Hashtbl.find
-                  type_def_info.api_table types).make]
+                let api =
+                  try
+                    Ocaml_in_python_api.TypeList.Hashtbl.find
+                      type_def_info.api_table types
+                  with Not_found ->
+                    failwith "make_type_converter" in
+                api.make]
             | Open _ -> [%expr
                 let type_def_info =
                   Ocaml_in_python_api.IntHashtbl.find
@@ -1417,8 +1485,13 @@ let make_type_converter (type_info : type_info) ocaml_env expansions params :
                     [%e Metapp.Exp.list
                       (List.map Metapp.Exp.of_int params_indexes)] in
                 type_def_info.make_api types;
-                (Ocaml_in_python_api.TypeList.Hashtbl.find
-                  type_def_info.api_table types).make]] in
+                let api =
+                  try
+                    Ocaml_in_python_api.TypeList.Hashtbl.find
+                      type_def_info.api_table types
+                  with Not_found ->
+                    failwith "make_type_converter" in
+                api.make]] in
           make (fst [%e capsule_var] v)
         and [%p Metapp.Pat.var (ocaml_of_python index.local_index)] = fun v ->
           if Py.Object.is_instance v
@@ -1430,49 +1503,67 @@ let make_type_converter (type_info : type_info) ocaml_env expansions params :
                       | Abstract -> [%expr failwith "Abstract type cannot be constructed"]
                       | Open _ -> [%expr
                           let type_def_info =
-                            Ocaml_in_python_api.IntHashtbl.find
-                              Ocaml_in_python_api.OpenType.table
-                              [%e Metapp.Exp.of_int type_info.index] in
+                            try
+                              Ocaml_in_python_api.IntHashtbl.find
+                                Ocaml_in_python_api.OpenType.table
+                                [%e Metapp.Exp.of_int type_info.index]
+                            with Not_found ->
+                              failwith "make_type_converter" in
                           let types =
                             List.map Ocaml_in_python_api.Type.of_index
                               [%e Metapp.Exp.list
                                   (List.map Metapp.Exp.of_int params_indexes)] in
                           type_def_info.make_api types;
                           let api_var =
-                            Ocaml_in_python_api.TypeList.Hashtbl.find type_def_info.api_table
-                              types in
+                            try
+                              Ocaml_in_python_api.TypeList.Hashtbl.find type_def_info.api_table
+                                types
+                            with Not_found ->
+                              failwith "make_type_converter" in
                           Py.Callable.to_function_as_tuple
                             (Py.Object.find_attr_string v "_set_api")
                             (Py.Tuple.singleton
                                (api_var.api.(Py.Int.to_int (Py.Object.find_attr_string v "_constructor_index"))))]
                       | Record _ -> [%expr
                           let type_def_info =
-                            Ocaml_in_python_api.IntHashtbl.find
-                              Ocaml_in_python_api.type_def_table
-                              [%e Metapp.Exp.of_int type_info.index] in
+                            try
+                              Ocaml_in_python_api.IntHashtbl.find
+                                Ocaml_in_python_api.type_def_table
+                                [%e Metapp.Exp.of_int type_info.index]
+                            with Not_found ->
+                              failwith "make_type_converter" in
                           let types =
                             List.map Ocaml_in_python_api.Type.of_index
                               [%e Metapp.Exp.list
                                   (List.map Metapp.Exp.of_int params_indexes)] in
                           let api_var =
-                            Ocaml_in_python_api.TypeList.Hashtbl.find type_def_info.api_table
-                              types in
+                            try
+                              Ocaml_in_python_api.TypeList.Hashtbl.find type_def_info.api_table
+                                types
+                            with Not_found ->
+                              failwith "make_type_converter" in
                           Py.Callable.to_function_as_tuple
                             (Py.Object.find_attr_string v "_set_api")
                             (Py.Tuple.singleton api_var.api)]
                       | Variant _ -> [%expr
                           let type_def_info =
-                            Ocaml_in_python_api.IntHashtbl.find
-                              Ocaml_in_python_api.variant_table
-                              [%e Metapp.Exp.of_int type_info.index] in
+                            try
+                              Ocaml_in_python_api.IntHashtbl.find
+                                Ocaml_in_python_api.variant_table
+                                [%e Metapp.Exp.of_int type_info.index]
+                            with Not_found ->
+                              failwith "make_type_converter" in
                           let types =
                             List.map Ocaml_in_python_api.Type.of_index
                               [%e Metapp.Exp.list
                                   (List.map Metapp.Exp.of_int params_indexes)] in
                           type_def_info.make_api types;
                           let api_var =
-                            Ocaml_in_python_api.TypeList.Hashtbl.find type_def_info.api_table
-                              types in
+                            try
+                              Ocaml_in_python_api.TypeList.Hashtbl.find type_def_info.api_table
+                                types
+                            with Not_found ->
+                              failwith "make_type_converter" in
                           Py.Callable.to_function_as_tuple
                             (Py.Object.find_attr_string v "_set_api")
                             (Py.Tuple.singleton
@@ -1482,11 +1573,23 @@ let make_type_converter (type_info : type_info) ocaml_env expansions params :
               snd [%e capsule_var] capsule
           else [%e
             let raise_error = [%expr
+              let given =
+                match Py.Object.get_attr_string v "_capsule" with
+                | Some capsule ->
+                    if capsule = Py.none then
+                      let c = Py.Object.find_attr_string v "__class__" in
+                      Format.asprintf "%s.%s"
+                        (Py.Object.to_string (Py.Object.find_attr_string c "__module__"))
+                        (Py.Object.to_string (Py.Object.find_attr_string c "__name__"))
+                    else
+                      Py.Capsule.type_of capsule
+                | None -> Py.Type.name (Py.Type.get v) in
               raise (Py.Err (TypeError,
-                Format.sprintf "%s expected but %s given"
-                  [%e Metapp.Exp.of_string (Format.asprintf "%a" Pprintast.longident
-                    type_info.longident)]
-                  (Py.Type.name (Py.Type.get v))))] in
+                Format.asprintf "%s expected but %s given"
+                  [%e Metapp.Exp.of_string (Format.asprintf "%a" Ppxlib.Pprintast.core_type
+                    (Ppxlib.Ast_helper.Typ.constr (Metapp.mkloc type_info.longident)
+                       (List.map Ocaml_in_python_api.Type.to_core_type params)))]
+                  given))] in
             match type_info.kind with
             | Record labels -> [%expr
                 if Py.Type.get v = Dict then [%e
@@ -1509,8 +1612,22 @@ let make_type_converter (type_info : type_info) ocaml_env expansions params :
     ocaml_of_python = Ocaml_in_python_api.Function.Implicit (Metapp.Exp.ident ocaml_of_python)}
 
 let add_type_converter (type_info : type_info) =
+  let class_ = get_variable_expression type_info.class_var in
   Types.Uid.Tbl.add type_constr_converter_tbl
-    type_info.type_declaration.type_uid (make_type_converter type_info)
+    type_info.type_declaration.type_uid {
+      converter = make_type_converter type_info;
+      class_;
+    }
+
+let with_compile_env f =
+  let root = prepare_compilation_opt () in
+  f ();
+  catch_compiler_errors (fun () ->
+    Option.iter (fun _ -> perform_compilation ()) root)
+
+let constr_name longident params =
+  Format.asprintf "%a" Ppxlib.Pprintast.core_type (Ppxlib.Ast_helper.Typ.constr
+    (Metapp.mkloc longident) (List.map Type.to_core_type params))
 
 let add_abstract_type_info _ocaml_env _expansions _python_module (type_info : type_info) =
   let table = Ocaml_in_python_api.TypeList.Hashtbl.create 16 in
@@ -1522,17 +1639,16 @@ let add_abstract_type_info _ocaml_env _expansions _python_module (type_info : ty
     try
       Ocaml_in_python_api.TypeList.Hashtbl.find table params
     with Not_found ->
-      let class_index = count class_count in
-      let capsule_class_var = Format.asprintf "class%d" class_index in
       let capsule_var = fresh_capsule_index () in
       let ty = type_of_params params in
       push_capsule_declaration (get_local_capsule_var capsule_var.local_index)
-        (Metapp.Exp.of_string capsule_class_var) ty;
+        (Metapp.Exp.of_string (constr_name type_info.longident params)) ty;
       Ocaml_in_python_api.TypeList.Hashtbl.add table params capsule_var;
       capsule_var in
   Ocaml_in_python_api.IntHashtbl.add Ocaml_in_python_api.type_def_table
     type_info.index {
-      make_capsule = (fun params -> ignore (capsule_var params));
+      make_capsule = (fun params -> with_compile_env (fun () ->
+        ignore (capsule_var params)));
       make_api = (fun _params -> ());
       api_table = Ocaml_in_python_api.TypeList.Hashtbl.create 16; };
   type_info.capsule_var <- capsule_var
@@ -1553,16 +1669,15 @@ let add_record_type_info ocaml_env expansions _python_module (type_info : type_i
       (Metapp.mkloc type_info.longident)
       (List.map Ocaml_in_python_api.Type.to_core_type params) in
   let capsule_var params =
+    check_arity type_info params;
     try
       Ocaml_in_python_api.TypeList.Hashtbl.find table params
     with Not_found ->
-      let class_index = count class_count in
-      let capsule_class_var = Format.asprintf "class%d" class_index in
       let capsule_var = fresh_capsule_index () in
       Ocaml_in_python_api.TypeList.Hashtbl.add table params capsule_var;
       let ty = type_of_params params in
       push_capsule_declaration (get_local_capsule_var capsule_var.local_index)
-        (Metapp.Exp.of_string capsule_class_var) ty;
+        (Metapp.Exp.of_string (constr_name type_info.longident params)) ty;
       capsule_var in
   let api_table : Py.Object.t Ocaml_in_python_api.api Ocaml_in_python_api.TypeList.Hashtbl.t =
     Ocaml_in_python_api.TypeList.Hashtbl.create 16 in
@@ -1573,7 +1688,10 @@ let add_record_type_info ocaml_env expansions _python_module (type_info : type_i
     with Not_found ->
       let _index = prepare_compilation_immediate () in
       let capsule_var =
-        Ocaml_in_python_api.TypeList.Hashtbl.find table params in
+        try
+          Ocaml_in_python_api.TypeList.Hashtbl.find table params
+        with Not_found ->
+          failwith "add_record_type_info" in
       let class_index = count class_count in
       let vars = Type.Vars.create () in
       let add_var (var_name : Types.type_expr) arg =
@@ -1658,9 +1776,12 @@ let add_record_type_info ocaml_env expansions _python_module (type_info : type_i
       let class_var = get_variable get_local_class_var type_info.class_var in
       push_structure [%str
         let type_def_info =
-          Ocaml_in_python_api.IntHashtbl.find
-            Ocaml_in_python_api.type_def_table
-            [%e Metapp.Exp.of_int type_info.index] in
+          try
+            Ocaml_in_python_api.IntHashtbl.find
+              Ocaml_in_python_api.type_def_table
+              [%e Metapp.Exp.of_int type_info.index]
+          with Not_found ->
+            failwith "add_record_type_info" in
         let make capsule =
           Py.Callable.to_function_as_tuple_and_dict
             [%e class_var] Py.Tuple.empty
@@ -1675,28 +1796,22 @@ let add_record_type_info ocaml_env expansions _python_module (type_info : type_i
       catch_compiler_errors (fun () -> perform_compilation ()) in
   Ocaml_in_python_api.IntHashtbl.add Ocaml_in_python_api.type_def_table
     type_info.index {
-      make_capsule = (fun params -> ignore (capsule_var params));
+      make_capsule = (fun params -> with_compile_env (fun () ->
+        ignore (capsule_var params)));
       make_api;
       api_table; };
   type_info.capsule_var <- capsule_var;
   let class_var = get_variable get_local_class_var type_info.class_var in
   push_structure [%str
     let type_def_info =
-      Ocaml_in_python_api.IntHashtbl.find Ocaml_in_python_api.type_def_table
-        [%e Metapp.Exp.of_int type_info.index] in
+      try
+        Ocaml_in_python_api.IntHashtbl.find Ocaml_in_python_api.type_def_table
+          [%e Metapp.Exp.of_int type_info.index]
+      with Not_found ->
+        failwith "add_record_type_info" in
     Py.Object.set_attr_string [%e class_var] "_api_for_type"
-      (Py.Callable.of_function_as_tuple (fun tuple ->
-        let type_list =
-          Py.List.to_list_map Ocaml_in_python_api.Type.of_python
-            (Py.Tuple.get tuple 0) in
-        let api =
-        try
-          Ocaml_in_python_api.TypeList.Hashtbl.find
-            type_def_info.api_table type_list
-        with Not_found ->
-          type_def_info.make_capsule type_list;
-          Ocaml_in_python_api.TypeList.Hashtbl.find
-            type_def_info.api_table type_list in api.api))]
+      (Py.Callable.of_function_as_tuple
+        (Ocaml_in_python_api.api_for_type type_def_info))]
 
 let add_variant_type_info ocaml_env expansions python_module (type_info : type_info)
       (constructors : _ Constructor.t list) =
@@ -1712,16 +1827,15 @@ let add_variant_type_info ocaml_env expansions python_module (type_info : type_i
       (Metapp.mkloc type_info.longident)
       (List.map Ocaml_in_python_api.Type.to_core_type params) in
   let capsule_var params =
+    check_arity type_info params;
     try
       Ocaml_in_python_api.TypeList.Hashtbl.find table params
     with Not_found ->
-      let class_index = count class_count in
-      let capsule_class_var = Format.asprintf "class%d" class_index in
       let capsule_var = fresh_capsule_index () in
       Ocaml_in_python_api.TypeList.Hashtbl.add table params capsule_var;
       let ty = type_of_params params in
       push_capsule_declaration (get_local_capsule_var capsule_var.local_index)
-        (Metapp.Exp.of_string capsule_class_var) ty;
+        (Metapp.Exp.of_string (constr_name type_info.longident params)) ty;
       capsule_var in
   let api_table : Py.Object.t array Ocaml_in_python_api.api Ocaml_in_python_api.TypeList.Hashtbl.t =
     Ocaml_in_python_api.TypeList.Hashtbl.create 16 in
@@ -1730,9 +1844,12 @@ let add_variant_type_info ocaml_env expansions python_module (type_info : type_i
       ignore (Ocaml_in_python_api.TypeList.Hashtbl.find api_table params);
       ()
     with Not_found ->
-      let _index = prepare_compilation_immediate () in
+      with_compile_env (fun () ->
       let capsule_var =
-        Ocaml_in_python_api.TypeList.Hashtbl.find table params in
+        try
+          Ocaml_in_python_api.TypeList.Hashtbl.find table params
+        with Not_found ->
+          failwith "add_variant_type_info" in
       let ty = type_of_params params in
       let class_index = count class_count in
       let vars = Type.Vars.create () in
@@ -1874,10 +1991,10 @@ let add_variant_type_info ocaml_env expansions python_module (type_info : type_i
       push_structure [%str
         let type_def_info =
           try
-          Ocaml_in_python_api.IntHashtbl.find
-            Ocaml_in_python_api.variant_table
-            [%e Metapp.Exp.of_int type_info.index]
-          with Not_found -> failwith "type_def_info" in
+            Ocaml_in_python_api.IntHashtbl.find
+              Ocaml_in_python_api.variant_table
+              [%e Metapp.Exp.of_int type_info.index]
+          with Not_found -> failwith "type_def_info: variant_table" in
         let make capsule = [%e
           Ppxlib.Ast_helper.Exp.match_
             [%expr snd [%e capsule_var] capsule]
@@ -1901,11 +2018,11 @@ let add_variant_type_info ocaml_env expansions python_module (type_info : type_i
               (List.map Metapp.Exp.of_int params_indexes)] in
         Ocaml_in_python_api.TypeList.Hashtbl.add type_def_info.api_table
           params
-          { api = [%e Metapp.Exp.var api_var]; make }];
-      catch_compiler_errors (fun () -> perform_compilation ()) in
+          { api = [%e Metapp.Exp.var api_var]; make }]) in
   Ocaml_in_python_api.IntHashtbl.add Ocaml_in_python_api.variant_table
     type_info.index {
-      make_capsule = (fun params -> ignore (capsule_var params));
+      make_capsule = (fun params -> with_compile_env (fun () ->
+        ignore (capsule_var params)));
       make_api;
       api_table };
   type_info.capsule_var <- capsule_var;
@@ -1914,24 +2031,14 @@ let add_variant_type_info ocaml_env expansions python_module (type_info : type_i
       try
         Ocaml_in_python_api.IntHashtbl.find Ocaml_in_python_api.variant_table
           [%e Metapp.Exp.of_int type_info.index]
-      with Not_found -> failwith "type_def_info" in
+      with Not_found -> failwith "type_def_info: variant_table2" in
     [%e Metapp.sequence (
       constructors |> List.mapi (fun i (cstr : _ Constructor.t) -> [%expr
         Py.Object.set_attr_string [%e Metapp.Exp.ident (get_variable_ident get_local_class_var cstr.class_var)]
           "_api_for_type"
           (Py.Callable.of_function_as_tuple (fun tuple ->
-            let type_list =
-              Py.List.to_list_map Ocaml_in_python_api.Type.of_python
-                (Py.Tuple.get tuple 0) in
-            let api =
-              try
-                Ocaml_in_python_api.TypeList.Hashtbl.find
-                  type_def_info.api_table type_list
-              with Not_found ->
-                type_def_info.make_capsule type_list;
-                Ocaml_in_python_api.TypeList.Hashtbl.find
-                  type_def_info.api_table type_list in
-            api.api.([%e Metapp.Exp.of_int i])))]))]]
+            let api = Ocaml_in_python_api.api_for_type type_def_info tuple in
+            api.([%e Metapp.Exp.of_int i])))]))]]
 
 let add_open_type_info ocaml_env expansions _python_module (type_info : type_info) constructors =
   let table = Ocaml_in_python_api.TypeList.Hashtbl.create 16 in
@@ -1940,15 +2047,14 @@ let add_open_type_info ocaml_env expansions _python_module (type_info : type_inf
       (Metapp.mkloc type_info.longident)
       (List.map Ocaml_in_python_api.Type.to_core_type params) in
   let capsule_var params =
+    check_arity type_info params;
     try
       Ocaml_in_python_api.TypeList.Hashtbl.find table params
     with Not_found ->
-      let class_index = count class_count in
-      let capsule_class_var = Format.asprintf "class%d" class_index in
       let capsule_var = fresh_capsule_index () in
       let ty = type_of_params params in
       push_capsule_declaration (get_local_capsule_var capsule_var.local_index)
-        (Metapp.Exp.of_string capsule_class_var) ty;
+        (Metapp.Exp.of_string (constr_name type_info.longident params)) ty;
       Ocaml_in_python_api.TypeList.Hashtbl.add table params capsule_var;
       capsule_var in
   let api_table : Py.Object.t array Ocaml_in_python_api.api Ocaml_in_python_api.TypeList.Hashtbl.t =
@@ -1960,7 +2066,10 @@ let add_open_type_info ocaml_env expansions _python_module (type_info : type_inf
     with Not_found ->
       let _index = prepare_compilation_immediate () in
       let capsule_var =
-        Ocaml_in_python_api.TypeList.Hashtbl.find table params in
+        try
+          Ocaml_in_python_api.TypeList.Hashtbl.find table params
+        with Not_found ->
+          failwith "add_open_type_info" in
       let ty = type_of_params params in
       let class_index = count class_count in
       let vars = Type.Vars.create () in
@@ -2129,7 +2238,8 @@ let add_open_type_info ocaml_env expansions _python_module (type_info : type_inf
       catch_compiler_errors (fun () -> perform_compilation ()) in
   Ocaml_in_python_api.IntHashtbl.add Ocaml_in_python_api.OpenType.table
     type_info.index {
-      make_capsule = (fun params -> ignore (capsule_var params));
+      make_capsule = (fun params -> with_compile_env (fun () ->
+        ignore (capsule_var params)));
       make_api;
       api_table };
   type_info.capsule_var <- capsule_var
@@ -2195,7 +2305,10 @@ let polymorphic_function_converter ~name ocaml_env expansions (vars : Type.Vars.
                 ident ocaml_exps])];
         catch_compiler_errors (fun () ->
           perform_compilation ());
-        Ocaml_in_python_api.TypeList.Hashtbl.find table types in
+        try
+          Ocaml_in_python_api.TypeList.Hashtbl.find table types
+        with Not_found ->
+          failwith "polymorphic_function_converter" in
     { make; table }) in
   let vars_count = Type.Vars.count vars in
   let vars_count_exp = Metapp.Exp.of_int vars_count in
@@ -2264,6 +2377,76 @@ let polymorphic_function_converter ~name ocaml_env expansions (vars : Type.Vars.
 
 let python_module_count = ref 0
 
+let postpone value = [%expr
+  Py.Callable.to_function_as_tuple (Py.Class.init "postponed"
+    ~fields:["computed", Py.Bool.f; "value", Py.none]
+    ~methods:["__get__", Py.Callable.of_function_as_tuple
+        (fun tuple ->
+          let self = Py.Tuple.get tuple 0 in
+          if Py.Bool.to_bool (Py.Object.find_attr_string self "computed")
+          then
+            Py.Object.find_attr_string self "value"
+          else
+            begin
+              let value = [%e value] in
+              Py.Object.set_attr_string self "value" value;
+              value
+            end)]) Py.Tuple.empty]
+
+let add_type_declaration_expansion ?orig_path path expansions (ident, _) =
+  let name = Ident.name ident in
+  let prefixed_path =
+    match orig_path with
+    | None -> Path.Pident ident
+    | Some orig_path -> Path.Pdot (orig_path, name) in
+  Path.Map.add prefixed_path (Path.Pdot (path, name)) expansions
+
+let rec add_module_declaration_expansions orig_path path expansions
+      (moddecl : Types.module_declaration) =
+  match moddecl.md_type with
+  | Mty_ident _ -> expansions
+  | Mty_signature signature ->
+      List.fold_left (add_signature_item_expansions orig_path path) expansions
+        signature
+  | Mty_functor _ -> expansions
+  | Mty_alias _path -> expansions
+
+and add_signature_item_expansions orig_path path expansions
+    (item : Types.signature_item) =
+  match item with
+  | Sig_type (ident, type_declaration, _rec_status, _visibility) ->
+      add_type_declaration_expansion ~orig_path path expansions
+        (ident, type_declaration)
+  | Sig_module (ident, _presence, decl, _rec, _visibility) ->
+      let orig_path' = Path.Pdot (orig_path, Ident.name ident) in
+      let path' = Path.Pdot (path, Ident.name ident) in
+      add_module_declaration_expansions orig_path' path' expansions decl
+  | _ -> expansions
+
+let add_type_manifest ocaml_env expansions python_module (ident, (decl : Types.type_declaration), (manifest : Types.type_expr)) =
+  match Metapp.Types.get_desc manifest with
+  | Tconstr (path, _args, _) ->
+      begin match type_info_of_constr ocaml_env expansions path with
+      | None -> ()
+      | Some type_info ->
+          push_structure
+            [%str Py.Module.set [%e python_module]
+              [%e Metapp.Exp.of_string (Ident.name ident)]
+              [%e get_variable_as_expression get_local_class_var type_info.class_]
+            ];
+          match decl.type_kind with
+          | Type_variant (constructors, _) ->
+              constructors |> List.iter (fun (cstr : Types.constructor_declaration) ->
+                let name = Ident.name cstr.cd_id in
+                let s = Metapp.Exp.of_string name in
+                push_structure
+                  [%str Py.Module.set [%e python_module] [%e s]
+                    (Py.Object.find_attr_string [%e get_variable_as_expression get_local_class_var type_info.class_] [%e s])
+                  ])
+          | _ -> ()
+      end
+  | _ -> ()
+
 let rec convert_signature_items ocaml_env expansions longident path python_module
       (list : Types.signature_item list) =
   match list with
@@ -2279,26 +2462,14 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
         let expr =
           if Type.Vars.count vars = 0 then
             begin
-            let converter = Type.to_value_converter ocaml_env expansions ~name ty in
+            let converter =
+              Type.to_value_converter ocaml_env expansions ~name ty in
+            let value =
+              Ocaml_in_python_api.Function.apply converter.python_of_ocaml
+                ident in
             match ty with
-            | Arrow _ ->
-                Ocaml_in_python_api.Function.apply converter.python_of_ocaml
-                  ident
-            | _ ->
-                [%expr Py.Callable.to_function_as_tuple (Py.Class.init "postponed"
-                ~fields:["computed", Py.Bool.f; "value", Py.none]
-                ~methods:["__get__", Py.Callable.of_function_as_tuple
-                    (fun tuple ->
-                      let self = Py.Tuple.get tuple 0 in
-                      if Py.Bool.to_bool (Py.Object.find_attr_string self "computed")
-                      then
-                        Py.Object.find_attr_string self "value"
-                      else
-                        let value =
-                          [%e Ocaml_in_python_api.Function.apply converter.python_of_ocaml
-                                       ident] in
-                        Py.Object.set_attr_string self "value" value;
-                        value)]) Py.Tuple.empty]
+            | Arrow _ -> value
+            | _ -> postpone value
             end
           else
             match ty with
@@ -2320,6 +2491,26 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
       end;
       convert_signature_items ocaml_env expansions longident path python_module tail
   | Sig_type (ident, type_declaration, rec_status, _visibility) :: tail ->
+      let name = Ident.name ident in
+      if name = "t" && longident = Ldot (Lident "Stdlib", "List") then
+        begin
+          push_structure [%str
+            Py.Module.set [%e python_module] "t"
+              (Py.Object.find_attr_string
+                (Ocaml_in_python_api.get_root_python_module ()) "list")]
+        end
+      else if name = "t" && longident = Ldot (Lident "Stdlib", "Option") then
+        begin
+          push_structure [%str
+            Py.Module.set [%e python_module] "t"
+              (Py.Object.find_attr_string
+                (Ocaml_in_python_api.get_root_python_module ()) "option");
+            Py.Module.set [%e python_module] "None" Py.none;
+            Py.Module.set [%e python_module] "Some"
+              (Py.Object.find_attr_string
+                (Ocaml_in_python_api.get_root_python_module ()) "Some")]
+        end
+      else
       let type_declarations = [ident, type_declaration] in
       let type_declarations, tail =
         match rec_status with
@@ -2327,11 +2518,8 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
         | Trec_first ->
             chop_other_type_declarations type_declarations tail
         | Trec_next -> assert false in
-      let add_type_declaration_expansion expansions (ident, _) =
-        Path.Map.add (Path.Pident ident)
-          (Path.Pdot (path, Ident.name ident)) expansions in
       let expansions' =
-        List.fold_left add_type_declaration_expansion expansions
+        List.fold_left (add_type_declaration_expansion path) expansions
           type_declarations in
       let expansions =
         match rec_status with
@@ -2346,10 +2534,16 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
           not (Types.Uid.Tbl.mem type_constr_converter_tbl
             declaration.type_uid))
           type_declarations in
+      let type_declarations, type_manifests =
+        List.partition_map (fun (ident, (decl : Types.type_declaration)) ->
+          match decl.type_manifest with
+          | None -> Left (ident, decl)
+          | Some manifest -> Right (ident, decl, manifest)) type_declarations in
       let type_infos =
         List.map (add_class_prototype longident) type_declarations in
       List.iter add_type_converter type_infos;
       List.iter (add_type_info ocaml_env expansions python_module) type_infos;
+      List.iter (add_type_manifest ocaml_env expansions python_module) type_manifests;
       convert_signature_items ocaml_env expansions' longident path python_module tail
   | Sig_typext (ident, ext, _status, _visibility) :: tail ->
       let name = Ident.name ident in
@@ -2363,7 +2557,7 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
       let cstr = cstr |> Constructor.map (fun ty ->
         Type.of_type_expr vars ocaml_env expansions ty) in
       let index = Ocaml_in_python_api.ExtensibleArray.push open_type.constructors (Some cstr) in
-      push_constructor_class longident' open_type.name class_var (fun (longident : Longident.t) -> Format.asprintf "%a" Pprintast.longident longident) index cstr;
+      push_constructor_class longident' class_var (fun (longident : Longident.t) -> Format.asprintf "%a" Pprintast.longident longident) index cstr;
       push_structure [%str
         Py.Module.set [%e python_module] [%e Metapp.Exp.of_string name]
           [%e Metapp.Exp.var (get_local_class_var cstr.class_var.local_index)]];
@@ -2375,36 +2569,39 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
         Py.Object.set_attr_string [%e Metapp.Exp.ident (get_variable_ident get_local_class_var cstr.class_var)]
               "_api_for_type"
               (Py.Callable.of_function_as_tuple (fun tuple ->
-                let type_list =
-                  Py.List.to_list_map Ocaml_in_python_api.Type.of_python
-                    (Py.Tuple.get tuple 0) in
                 let api =
-                  try
-                    Ocaml_in_python_api.TypeList.Hashtbl.find
-                      type_def_info.api_table type_list
-                  with Not_found ->
-                    type_def_info.make_capsule type_list;
-                    Ocaml_in_python_api.TypeList.Hashtbl.find
-                      type_def_info.api_table type_list in
-               api.api.([%e Metapp.Exp.of_int index])))];
+                  Ocaml_in_python_api.api_for_type type_def_info tuple in
+               api.([%e Metapp.Exp.of_int index])))];
       convert_signature_items ocaml_env expansions longident path python_module tail
   | Sig_module (ident, _presence, decl, _rec, _visibility) :: tail ->
       let name = Ident.name ident in
       let longident' = Longident.Ldot (longident, name) in
+      let path' = Path.Pdot (path, name) in
+      (* We don't reflect the internal module Stdlib.Oo since it contains
+         internals that interact wierdly with code generation. *)
       if longident' <> Ldot (Lident "Stdlib", "Oo") then
         begin
-          let path' = Path.Pdot (path, name) in
-          match
-            (python_of_module_declaration ocaml_env expansions
-               longident' path' decl : Ocaml_in_python_api.Paths.index_cell option)
-          with
-          | Some { index; class_ = _ } ->
-              push_structure [%str
-                Py.Module.set [%e python_module] [%e Metapp.Exp.of_string name]
-                 (Ocaml_in_python_api.Paths.get [%e Metapp.Exp.of_int index]).class_]
-          | None -> ()
+          let l =
+            lazy (match
+                (python_of_module_declaration ocaml_env expansions
+                   longident' path' decl : Ocaml_in_python_api.Paths.index_cell
+                                             option)
+              with
+              | Some { index = _; class_ } -> class_
+              | None -> Py.none) in
+          Ocaml_in_python_api.pending_module_table :=
+            Path.Map.add path' l !Ocaml_in_python_api.pending_module_table;
+          let index =
+            Ocaml_in_python_api.ExtensibleArray.push
+              Ocaml_in_python_api.pending_modules l in
+          push_structure [%str
+            Py.Module.set [%e python_module] [%e Metapp.Exp.of_string name] [%e
+              postpone [%expr Lazy.force (Ocaml_in_python_api.ExtensibleArray.get
+                Ocaml_in_python_api.pending_modules [%e Metapp.Exp.of_int index])]]];
         end;
-      convert_signature_items ocaml_env expansions longident path python_module tail
+      let expansions' =
+        add_module_declaration_expansions (Path.Pident ident) path' expansions decl in
+      convert_signature_items ocaml_env expansions' longident path python_module tail
   | _ :: tail ->
       convert_signature_items ocaml_env expansions longident path python_module tail
 
@@ -2478,11 +2675,12 @@ let value_converter_of_bytes : Ocaml_in_python_api.value_converter = {
 
 let () =
   import_ocaml_module_in_python_ref := (fun ocaml_env (expansions : Path.t Path.Map.t) name ->
+    catch_compiler_errors (fun () ->
     let ({ class_; index = _ } : Ocaml_in_python_api.Paths.index_cell) =
       Option.get (python_of_module_name ocaml_env expansions name) in
     let ocaml = Ocaml_in_python_api.get_root_python_module () in
     Py.Module.set ocaml name class_;
-    class_)
+    class_))
 
 let initialize_python ocaml_env =
   Py.initialize ();
@@ -2507,9 +2705,6 @@ let initialize_python ocaml_env =
   register_primitive "debug" (fun _tuple ->
     debug := true;
     Py.none);
-  register_primitive "__getattr__" (fun tuple ->
-    let name = Py.String.to_string (Py.Tuple.get tuple 0) in
-    import_ocaml_module_in_python ocaml_env Path.Map.empty name);
   let list = Py.Module.get ocaml "list" in
   Py.Object.set_attr_string list "_api_for_type"
     (Py.Callable.of_function_as_tuple (fun tuple ->
@@ -2535,54 +2730,78 @@ let initialize_python ocaml_env =
   let register_lident lident converter =
     let uid = uid_of_type_lident ocaml_env lident in
     Types.Uid.Tbl.add type_constr_converter_tbl uid converter in
-  register_path Predef.path_unit
+  register_path Predef.path_unit {
+      converter =
     (fun _env _expansions _args -> {
       python_of_ocaml = Explicit (fun v -> [%expr [%e v]; Py.none]);
-      ocaml_of_python = Explicit (fun v -> [%expr ignore [%e v]; ()]); });
-  register_path Predef.path_int
+      ocaml_of_python = Explicit (fun v -> [%expr ignore [%e v]; ()]);});
+      class_ = Left [%expr Py.Object.find_attr_string Py.none "__class__"]};
+  register_path Predef.path_int {
+      converter =
     (fun _env _expansions _args -> {
       python_of_ocaml = Implicit [%expr Py.Int.of_int];
       ocaml_of_python = Implicit [%expr Py.Int.to_int] });
-  register_path Predef.path_int64
+      class_ = Left [%expr Py.Object.find_attr_string (Ocaml_in_python_api.get_root_python_module ()) "int"]};
+  register_path Predef.path_int64 {
+      converter =
     (fun _env _expansions _args -> {
       python_of_ocaml = Implicit [%expr Py.Int.of_int64];
       ocaml_of_python = Implicit [%expr Py.Int.to_int64] });
-  register_path Predef.path_int32
+      class_ = Left [%expr Py.Object.find_attr_string (Ocaml_in_python_api.get_root_python_module ()) "int"]};
+  register_path Predef.path_int32 {
+      converter =
     (fun _env _expansions _args -> {
       python_of_ocaml = Explicit (fun v -> [%expr
         Py.Int.of_int64 (Int64.of_int32 [%e v])]);
       ocaml_of_python = Explicit (fun v -> [%expr
         Int64.to_int32 (Py.Int.to_int64 [%e v])]); });
-  register_path Predef.path_nativeint
+      class_ = Left [%expr Py.Object.find_attr_string (Ocaml_in_python_api.get_root_python_module ()) "int"]};
+  register_path Predef.path_nativeint {
+      converter =
     (fun _env _expansions _args -> {
       python_of_ocaml = Explicit (fun v -> [%expr
         Py.Int.of_int64 (Int64.of_nativeint [%e v])]);
       ocaml_of_python = Explicit (fun v -> [%expr
         Int64.to_nativeint (Py.Int.to_int64 [%e v])]); });
-  register_path Predef.path_char
+      class_ = Left [%expr Py.Object.find_attr_string (Ocaml_in_python_api.get_root_python_module ()) "int"]};
+  register_path Predef.path_char {
+      converter =
     (fun _env _expansions _args -> {
       python_of_ocaml = Implicit [%expr Ocaml_in_python_api.py_of_char];
       ocaml_of_python = Implicit [%expr Ocaml_in_python_api.char_of_py] });
-  register_path Predef.path_string (fun _env _expansions _args -> {
+      class_ = Left [%expr Py.Object.find_attr_string (Ocaml_in_python_api.get_root_python_module ()) "string"]};
+  register_path Predef.path_string {
+      converter = (fun _env _expansions _args -> {
     python_of_ocaml = Implicit [%expr Py.String.of_string];
     ocaml_of_python = Implicit [%expr Py.String.to_string] });
-  register_path Predef.path_bool (fun _env _expansions _args -> {
+      class_ = Left [%expr Py.Object.find_attr_string (Ocaml_in_python_api.get_root_python_module ()) "string"]};
+  register_path Predef.path_bool {
+      converter = (fun _env _expansions _args -> {
     python_of_ocaml = Implicit [%expr Py.Bool.of_bool];
     ocaml_of_python = Implicit [%expr Py.Bool.to_bool] });
-  register_path Predef.path_float (fun _env _expansions _args -> {
+      class_ = Left [%expr Py.Object.find_attr_string (Ocaml_in_python_api.get_root_python_module ()) "bool"]};
+  register_path Predef.path_float {
+      converter = (fun _env _expansions _args -> {
     python_of_ocaml = Implicit [%expr Py.Float.of_float];
     ocaml_of_python = Implicit [%expr Py.Float.to_float] });
-  register_path Predef.path_array (fun ocaml_env expansions args ->
+      class_ = Left [%expr Py.Object.find_attr_string (Ocaml_in_python_api.get_root_python_module ()) "float"]};
+  register_path Predef.path_array {
+      converter = (fun ocaml_env expansions args ->
     match args with
     | [arg] -> value_converter_of_array ocaml_env expansions arg
     | _ -> assert false);
-  register_path Predef.path_list (fun ocaml_env expansions args ->
+      class_ = Left [%expr Py.Object.find_attr_string (Ocaml_in_python_api.get_root_python_module ()) "array"]};
+  register_path Predef.path_list {
+      converter = (fun ocaml_env expansions args ->
     match args with
     | [arg] -> value_converter_of_list ocaml_env expansions arg
     | _ -> assert false);
-  register_path Predef.path_bytes (fun _env _expansions _args ->
-    value_converter_of_bytes);
-  register_path Predef.path_option (fun ocaml_env expansions args ->
+      class_ = Left [%expr Py.Object.find_attr_string (Ocaml_in_python_api.get_root_python_module ()) "list"]};
+  register_path Predef.path_bytes {
+      converter = (fun _env _expansions _args -> value_converter_of_bytes);
+      class_ = Left [%expr Py.Object.find_attr_string (Ocaml_in_python_api.get_root_python_module ()) "bytes"]};
+  register_path Predef.path_option {
+      converter = (fun ocaml_env expansions args ->
     let arg = match args with [arg] -> arg | _ -> assert false in
     let converter = Type.to_value_converter ocaml_env expansions arg in
     if Type.has_none ocaml_env arg then {
@@ -2595,18 +2814,20 @@ let initialize_python ocaml_env =
             Py.Callable.to_function_as_tuple some (Py.Tuple.singleton
               ([%e Ocaml_in_python_api.Function.to_expression converter.python_of_ocaml] v))]);
       ocaml_of_python = Explicit (fun v -> [%expr
+        let v = [%e v] in
         if v = Py.none then
           None
         else
           let ocaml = Ocaml_in_python_api.get_root_python_module () in
           let some = Py.Module.get ocaml "Some" in
-          let v = [%e v] in
           let destructed =
             if Py.Object.is_instance v some then
               Py.Sequence.get v 0
             else
               v in
-          Some ([%e Ocaml_in_python_api.Function.to_expression converter.ocaml_of_python] v)])}
+          Some ([%e
+            Ocaml_in_python_api.Function.to_expression
+              converter.ocaml_of_python] destructed)])}
     else {
       python_of_ocaml = Explicit (fun v -> [%expr
         match [%e v] with
@@ -2618,18 +2839,23 @@ let initialize_python ocaml_env =
           None
         else
           Some ([%e Ocaml_in_python_api.Function.to_expression converter.ocaml_of_python] v)])});
-  register_path Predef.path_extension_constructor
+      class_ = Left [%expr Py.Object.find_attr_string Py.none "__class__"]};
+  register_path Predef.path_extension_constructor {
+      converter =
     (fun _env _expansions _args -> {
       python_of_ocaml = Implicit [%expr Ocaml_in_python_api.Extension_constructor.to_python];
       ocaml_of_python = Implicit [%expr Ocaml_in_python_api.Extension_constructor.of_python] });
-  register_path Predef.path_floatarray
+      class_ = Left [%expr Py.Object.find_attr_string Py.none "__class__"]};
+  register_path Predef.path_floatarray {
+      converter =
     (fun _env _expansions _args -> {
       python_of_ocaml = Implicit [%expr Py.Array.numpy];
       ocaml_of_python = Implicit [%expr Ocaml_in_python_api.get_floatarray] });
+      class_ = Left [%expr Py.Object.find_attr_string (Ocaml_in_python_api.get_root_python_module ()) "array"]};
   let index = count type_count in
   let constructors = Ocaml_in_python_api.ExtensibleArray.create None 16 in
   Ocaml_in_python_api.exception_class := Py.Object.find_attr_string ocaml "exn";
-  let class_var = LidentRef (Ldot (Lident "Ocaml_in_python_api", "exception_class")) in
+  let class_var : lident_or_variable_index = Left (Ldot (Lident "Ocaml_in_python_api", "exception_class")) in
   let name = "exn" in
   let type_info = {
       index;
@@ -2646,7 +2872,9 @@ let initialize_python ocaml_env =
   exn_converter_ref := (fun ocaml_env expansions ->
     (exn_converter ocaml_env expansions []));
   Types.Uid.Tbl.add type_constr_converter_tbl
-    type_info.type_declaration.type_uid exn_converter;
+    type_info.type_declaration.type_uid {
+      converter = exn_converter;
+      class_ = Left [%expr Metapp.Exp.ident class_var]};
   ignore (prepare_compilation_immediate ());
   let python_module = [%expr Ocaml_in_python_api.get_root_python_module ()] in
   add_type_info ocaml_env Path.Map.empty python_module type_info;
@@ -2664,13 +2892,24 @@ let initialize_python ocaml_env =
       let fd = Py.Int.to_int (Py.Callable.to_function_as_tuple
         (Py.Object.find_attr_string [%e v] "fileno") Py.Tuple.empty) in
       [%e of_descr] (Ocaml_in_python_api.fd_of_int fd)])} in
-  register_lident (Lident "in_channel")
-    (wrap_channel [%expr Unix.in_channel_of_descr]
+  register_lident (Lident "in_channel") {
+    converter = (wrap_channel [%expr Unix.in_channel_of_descr]
       [%expr Unix.descr_of_in_channel] "rb");
-  register_lident (Lident "out_channel")
-    (wrap_channel [%expr Unix.out_channel_of_descr]
+    class_ = Left [%expr Py.Object.find_attr_string Py.none "__class__"]};
+  register_lident (Lident "out_channel") {
+    converter = (wrap_channel [%expr Unix.out_channel_of_descr]
       [%expr Unix.descr_of_out_channel] "ab");
-  Type.value_converter_of_tuple := value_converter_of_tuple
+    class_ = Left [%expr Py.Object.find_attr_string Py.none "__class__"]};
+  Type.value_converter_of_tuple := value_converter_of_tuple;
+  let stdlib =
+    import_ocaml_module_in_python ocaml_env Path.Map.empty "Stdlib" in
+  register_primitive "__getattr__" (fun tuple ->
+    let name = Py.String.to_string (Py.Tuple.get tuple 0) in
+    if name = "" then
+      raise (Py.Err (AttributeError, "Invalid empty name"));
+    try Py.Object.find_attr_string stdlib name
+    with Not_found | Py.E _ ->
+      import_ocaml_module_in_python ocaml_env Path.Map.empty name)
 
 let initialize_ocaml_env () =
   ignore (Warnings.parse_options false "-3-58"); (* deprecated, no-cmx-file *)
