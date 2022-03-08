@@ -1,0 +1,9 @@
+(rule
+  (alias runtest)
+  (deps
+     aliases.py
+     ../../ocaml/ocaml_in_python.so
+     ../../ocaml/__init__.py)
+  (action
+   (setenv PYTHONPATH %{workspace_root}:%{env:PYTHONPATH=}
+   (run python aliases.py))))
