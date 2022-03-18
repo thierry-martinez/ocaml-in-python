@@ -1,5 +1,4 @@
 import ocaml
-from ocaml import Stdlib
 #ocaml.add_dir("../../api/.ocaml_in_python_api.objs/byte/")
 #ocaml.add_dir(".examples.objs/byte/")
 #try:
@@ -34,7 +33,7 @@ print(m.of_list(["a", "b", "c"]))
 
 try:
     print(m.of_list([]))
-except ocaml.Stdlib.Invalid_argument as e:
+except ocaml.Invalid_argument as e:
     print(e)
     # => output: Stdlib.Invalid_argument("of_list")
 

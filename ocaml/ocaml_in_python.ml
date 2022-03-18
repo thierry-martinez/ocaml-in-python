@@ -2491,26 +2491,6 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
       end;
       convert_signature_items ocaml_env expansions longident path python_module tail
   | Sig_type (ident, type_declaration, rec_status, _visibility) :: tail ->
-      let name = Ident.name ident in
-      if name = "t" && longident = Ldot (Lident "Stdlib", "List") then
-        begin
-          push_structure [%str
-            Py.Module.set [%e python_module] "t"
-              (Py.Object.find_attr_string
-                (Ocaml_in_python_api.get_root_python_module ()) "list")]
-        end
-      else if name = "t" && longident = Ldot (Lident "Stdlib", "Option") then
-        begin
-          push_structure [%str
-            Py.Module.set [%e python_module] "t"
-              (Py.Object.find_attr_string
-                (Ocaml_in_python_api.get_root_python_module ()) "option");
-            Py.Module.set [%e python_module] "None" Py.none;
-            Py.Module.set [%e python_module] "Some"
-              (Py.Object.find_attr_string
-                (Ocaml_in_python_api.get_root_python_module ()) "Some")]
-        end
-      else
       let type_declarations = [ident, type_declaration] in
       let type_declarations, tail =
         match rec_status with
@@ -2525,25 +2505,47 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
         match rec_status with
         | Trec_first -> expansions'
         | _ -> expansions in
-      let type_declarations =
-        List.filter (fun (_ident, (declaration : Types.type_declaration)) ->
-          let () =
-            try
-              ignore (Ocaml_common.Env.find_type (Path.Pident ident) ocaml_env)
-            with Not_found -> prerr_endline "Not found!" in
-          not (Types.Uid.Tbl.mem type_constr_converter_tbl
-            declaration.type_uid))
-          type_declarations in
-      let type_declarations, type_manifests =
-        List.partition_map (fun (ident, (decl : Types.type_declaration)) ->
-          match decl.type_manifest with
-          | None -> Left (ident, decl)
-          | Some manifest -> Right (ident, decl, manifest)) type_declarations in
-      let type_infos =
-        List.map (add_class_prototype longident) type_declarations in
-      List.iter add_type_converter type_infos;
-      List.iter (add_type_info ocaml_env expansions python_module) type_infos;
-      List.iter (add_type_manifest ocaml_env expansions python_module) type_manifests;
+      begin
+        let name = Ident.name ident in
+        if name = "t" && longident = Ldot (Lident "Stdlib", "List") then
+          begin
+            push_structure [%str
+              Py.Module.set [%e python_module] "t"
+                (Py.Object.find_attr_string
+                  (Ocaml_in_python_api.get_root_python_module ()) "list")]
+          end
+        else if name = "t" && longident = Ldot (Lident "Stdlib", "Option") then
+          begin
+            push_structure [%str
+              Py.Module.set [%e python_module] "t"
+                (Py.Object.find_attr_string
+                  (Ocaml_in_python_api.get_root_python_module ()) "option");
+              Py.Module.set [%e python_module] "None" Py.none;
+              Py.Module.set [%e python_module] "Some"
+                (Py.Object.find_attr_string
+                  (Ocaml_in_python_api.get_root_python_module ()) "Some")]
+          end
+        else
+          let type_declarations =
+            List.filter (fun (_ident, (declaration : Types.type_declaration)) ->
+              let () =
+                try
+                  ignore (Ocaml_common.Env.find_type (Path.Pident ident) ocaml_env)
+                with Not_found -> prerr_endline "Not found!" in
+              not (Types.Uid.Tbl.mem type_constr_converter_tbl
+                declaration.type_uid))
+              type_declarations in
+          let type_declarations, type_manifests =
+            List.partition_map (fun (ident, (decl : Types.type_declaration)) ->
+              match decl.type_manifest with
+              | None -> Left (ident, decl)
+              | Some manifest -> Right (ident, decl, manifest)) type_declarations in
+          let type_infos =
+            List.map (add_class_prototype longident) type_declarations in
+          List.iter add_type_converter type_infos;
+          List.iter (add_type_info ocaml_env expansions python_module) type_infos;
+          List.iter (add_type_manifest ocaml_env expansions python_module) type_manifests;
+      end;
       convert_signature_items ocaml_env expansions' longident path python_module tail
   | Sig_typext (ident, ext, _status, _visibility) :: tail ->
       let name = Ident.name ident in
