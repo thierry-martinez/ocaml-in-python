@@ -346,13 +346,16 @@ field names.
 
 For variants, there is a sub-class by constructor, which behaves
 either as a tuple or as a record.
-The values of the arguments are converted on demand
+The values of the arguments are converted on demand.
 Variants support pattern-matching (with Python >= 3.10).
-Constant constructors `None` are mapped to the Python `None` value.
 
 ### Sub-module definitions
 
 Sub-modules are mapped to classes, which are constructed on demand.
+For instance, the module `Array.Floatarray` is exposed as
+`ocaml.Array.Floatarray`, and, in particular, the function
+`Array.Floatarray.create` is available as
+`ocaml.Array.Floatarray.create`.
 
 ## Limitations
 
