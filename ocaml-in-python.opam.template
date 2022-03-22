@@ -2,7 +2,7 @@ post-messages: "\
 You should register the \"ocaml\" package in your Python environment.
 There are two options:
 
-  (1) either you  register the package with \"pip\" using the following
+  (1) either you register the package with \"pip\" using the following
       command:
         pip install --editable \"%{lib}%/ocaml-in-python\"
 
