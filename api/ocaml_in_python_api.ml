@@ -278,7 +278,7 @@ module Paths = struct
       class_ : Py.Object.t;
     }
 
-  let dummy = { path = Path.Pident Predef.ident_none; class_ = Py.null }
+  let dummy = { path = Predef.path_int; class_ = Py.null }
 
   let store : path_cell ExtensibleArray.t =
     ExtensibleArray.create dummy 16

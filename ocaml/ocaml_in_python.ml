@@ -31,7 +31,7 @@
 
 let add_dir d =
   let dir = Load_path.Dir.create d in
-  Load_path.prepend_dir dir
+  Load_path.append_dir dir
 
 let debug = ref false
 
@@ -2916,10 +2916,7 @@ let initialize_python ocaml_env =
 let initialize_ocaml_env () =
   ignore (Warnings.parse_options false "-3-58"); (* deprecated, no-cmx-file *)
   Clflags.native_code := true;
-  [%meta if Sys.ocaml_version >= "4.09.0" then
-    [%e Ocaml_common.Compmisc.init_path ()]
-  else
-    [%e Ocaml_common.Compmisc.init_path false]];
+  Ocaml_common.Compmisc.init_path ();
   Ocaml_common.Compmisc.initial_env ()
 
 let initialize_findlib () =
