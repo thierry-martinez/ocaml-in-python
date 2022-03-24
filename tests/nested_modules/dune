@@ -8,4 +8,4 @@
      ../../ocaml/__init__.py)
   (action
    (setenv PYTHONPATH %{workspace_root}:%{env:PYTHONPATH=}
-    (run python nested_modules.py))))
+    (run python3 nested_modules.py))))

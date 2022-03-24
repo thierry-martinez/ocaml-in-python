@@ -6,4 +6,4 @@
      ../../ocaml/__init__.py)
   (action
    (setenv PYTHONPATH %{workspace_root}:%{env:PYTHONPATH=}
-   (run python aliases.py))))
+   (run python3 aliases.py))))
