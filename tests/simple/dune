@@ -3,7 +3,7 @@
 
 (rule
   (alias runtest)
-  (deps simple.py simple.cmxs
+  (deps simple.py simple_3_10.py simple.cmxs
      ../../ocaml/ocaml_in_python.so
      ../../ocaml/__init__.py)
   (action

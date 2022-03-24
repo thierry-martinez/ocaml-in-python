@@ -5,20 +5,9 @@ ocaml.loadfile("extension_constructors.cmxs")
 
 from ocaml import Extension_constructors
 
-match Extension_constructors.a:
-    case Extension_constructors.B(_):
-        assert(False)
-    case Extension_constructors.A():
-        pass
-    case _:
-        assert(False)
-
-match Extension_constructors.b(2):
-    case Extension_constructors.B(1):
-        assert(False)
-    case Extension_constructors.B(2):
-        pass
-    case _:
-        assert(False)
-
 assert(Extension_constructors.get_b(Extension_constructors.B(1)) == 1)
+
+import sys
+
+if sys.hexversion >= 0x03100000:
+    import extension_constructors_3_10
