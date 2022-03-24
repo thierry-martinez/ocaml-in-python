@@ -23,4 +23,5 @@ Effortless Python bindings for OCaml modules
   (ppxlib (>= 0.23.0))
   (metapp (>= 0.4.3))
   (metaquot (>= 0.5.1))
-  (pyml (>= 20220322))))
+  (pyml (>= 20220322))
+  conf-python-3))
