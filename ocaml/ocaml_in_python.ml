@@ -231,20 +231,17 @@ let cut_compilation () =
 let catch_compiler_errors f =
   try
     f ()
-  with Env.Error error ->
-         let error_msg = Format.asprintf "%a" Env.report_error error in
-         raise (Py.Err (ImportError, error_msg))
-     | exn ->
-         match Location.error_of_exn exn with
-         | None -> raise exn
-         | Some (`Ok error) ->
-             let error_msg = Format.asprintf "%a" Location.print_report error in
-             raise (Py.Err (ImportError, error_msg))
-         | Some `Already_displayed -> assert false
-(*
-     | exc ->
-         raise (Py.Err (ImportError, Printexc.to_string exc))
-*)
+  with
+  | Env.Error error ->
+      let error_msg = Format.asprintf "%a" Env.report_error error in
+      raise (Py.Err (ImportError, error_msg))
+  | exn ->
+      let error_msg =
+        match Location.error_of_exn exn with
+        | None -> Printexc.to_string exn
+        | Some (`Ok error) -> Format.asprintf "%a" Location.print_report error
+        | Some `Already_displayed -> assert false in
+      raise (Py.Err (ImportError, error_msg))
 
 let make_python_tuple (values : Ppxlib.expression list) : Ppxlib.expression =
   let length = List.length values in
@@ -2923,13 +2920,12 @@ let initialize_findlib () =
   Findlib.init ();
   add_dir (Findlib.package_directory "stdcompat");
   add_dir (Findlib.package_directory "pyml");
-  begin match
-    Findlib.package_directory "ocaml-in-python.api"
-  with
-  | dir -> add_dir dir
-  | exception (Fl_package_base.No_such_package _) ->
-      add_dir ("../../api/.ocaml_in_python_api.objs/byte/")
-  end
+  let local_api_dir = "../../api/.ocaml_in_python_api.objs/byte/" in
+  if Sys.file_exists local_api_dir then
+    add_dir local_api_dir
+  else
+    add_dir (catch_compiler_errors (fun () ->
+      Findlib.package_directory "ocaml-in-python.api"))
 
 let () =
   let ocaml_env = initialize_ocaml_env () in
