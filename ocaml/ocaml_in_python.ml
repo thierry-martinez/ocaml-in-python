@@ -146,14 +146,22 @@ let compile_and_load_structure ocaml_env module_name structure =
       Compilenv.reset module_name;
       let impl =
         Typemod.type_implementation "" "" module_name ocaml_env structure in
+      let transl_implementation =
+        if Config.flambda then
+          Translmod.transl_implementation_flambda
+        else
+          Translmod.transl_store_implementation in
       let program =
-        Translmod.transl_store_implementation module_name
-          (impl.structure, impl.coercion) in
+        transl_implementation module_name (impl.structure, impl.coercion) in
       let program =
         { program with code = Simplif.simplify_lambda program.code } in
       let filename_dll = Filename.temp_file "ocaml-in-python" Config.ext_dll in
       let prefixname = Filename.chop_extension filename_dll in
-      let middle_end = Closure_middle_end.lambda_to_clambda in
+      let middle_end =
+        if Config.flambda then
+          Flambda_middle_end.lambda_to_clambda
+        else
+          Closure_middle_end.lambda_to_clambda in
       let ppf_dump = Format.err_formatter in
       Asmgen.compile_implementation ~backend ~prefixname ~middle_end ~ppf_dump
         program;
