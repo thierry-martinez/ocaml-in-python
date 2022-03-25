@@ -3,6 +3,12 @@
 This library exposes all OCaml modules as Python modules, generating
 bindings on the fly.
 
+## Requirements
+
+- `OCaml` >= 4.13
+
+- `Python` >= 3.7 (and >= 3.10 for pattern-matching support)
+
 ## Setup
 
 The package can be installed via `opam`:

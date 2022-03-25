@@ -2682,7 +2682,6 @@ let () =
     class_))
 
 let initialize_python ocaml_env =
-  Py.initialize ();
   let ocaml = Ocaml_in_python_api.get_root_python_module () in
   let register_primitive name f =
     Py.Module.set ocaml name (Py.Callable.of_function_as_tuple (fun tuple ->
@@ -2928,7 +2927,13 @@ let initialize_findlib () =
       Findlib.package_directory "ocaml-in-python.api"))
 
 let () =
-  let ocaml_env = initialize_ocaml_env () in
-  root_ocaml_env := Some ocaml_env;
-  initialize_findlib ();
-  initialize_python ocaml_env
+  Py.initialize ();
+  ignore (Py.Callable.handle_errors (fun () ->
+    if (Py.version_major (), Py.version_minor ()) < (3, 7) then
+      raise (Py.Err (ImportError, "Python >=3.7 is required"));
+    let ocaml_env = initialize_ocaml_env () in
+    root_ocaml_env := Some ocaml_env;
+    initialize_findlib ();
+    initialize_python ocaml_env;
+    Py.none) ());
+  ()
