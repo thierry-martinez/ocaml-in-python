@@ -24,5 +24,5 @@ Effortless Python bindings for OCaml modules
   (metapp (>= 0.4.3))
   (metaquot (>= 0.5.1))
   (pyml (>= 20220325))
-  conf-python-3
+  conf-python-3-7
   (parmap :with-test)))
