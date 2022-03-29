@@ -21,7 +21,7 @@ The package can be installed via `opam`:
 Once installed via `opam`, the package should be registered in the Python environment.
 There are two options:
 
-- either you register the package with `pip` using the following command:
+- either you register the package with `pip` using the following command (requires Python >=3.8):
 ```bash
 pip install --editable "`opam var ocaml-in-python:lib`"
 ```
@@ -65,7 +65,7 @@ function `incr`).
 
 ### OCaml module compiled on the fly
 
-In the following example, we compile a module on the fly from Python.
+In the following example, we compile an OCaml module on the fly from Python.
 
 ```python
 import ocaml
