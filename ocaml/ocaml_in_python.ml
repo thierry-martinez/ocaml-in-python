@@ -465,7 +465,9 @@ let make_property ?(getter = [%expr Py.none]) ?(setter = [%expr Py.none]) () =
     Py.Module.get_function (Py.Module.builtins ()) "property"
       [%e Metapp.Exp.array [getter; setter]]]
 
-let make_ocaml_function_call ocaml_env expansions arity (result_converter : Ocaml_in_python_api.value_converter) f ocaml_exps = [%expr
+let make_ocaml_function_call ocaml_env expansions arity (result_converter : Ocaml_in_python_api.value_converter) f ocaml_exps =
+  let ocaml_exps =
+    ocaml_exps |> List.map (fun (label, exp) -> (label, exp ())) in [%expr
   [%e check_arguments arity];
   try
     let result = [%e Ppxlib.Ast_helper.Exp.apply f ocaml_exps] in
@@ -626,13 +628,13 @@ module Type = struct
     let add_arg (index, python_args, python_dict)
       (param : param) :
       _ * ((Ppxlib.arg_label * Ppxlib.pattern)
-      * (Ppxlib.arg_label * Ppxlib.expression)) =
+      * (Ppxlib.arg_label * (unit -> Ppxlib.expression))) =
       match param.label with
       | Nolabel ->
           let arg_converter = to_value_converter ocaml_env expansions param.ty in
           if is_unit_type param.ty then
             (index, python_args, python_dict),
-            ((Nolabel, [%pat? ()]), (Nolabel, [%expr ()]))
+            ((Nolabel, [%pat? ()]), (Nolabel, (fun () -> [%expr ()])))
           else
             let var = Printf.sprintf "x%d" index in
             let python_args =
@@ -640,8 +642,8 @@ module Type = struct
                 (Metapp.Exp.var var) :: python_args in
             (index + 1, python_args, python_dict),
             ((Nolabel, Metapp.Pat.var var),
-              (Nolabel, Ocaml_in_python_api.Function.apply arg_converter.ocaml_of_python
-                [%expr Py.Tuple.get args_tuple [%e Metapp.Exp.of_int index]]))
+              (Nolabel, (fun () -> Ocaml_in_python_api.Function.apply arg_converter.ocaml_of_python
+                [%expr Py.Tuple.get args_tuple [%e Metapp.Exp.of_int index]])))
       | Labelled label ->
           let arg_converter = to_value_converter ocaml_env expansions param.ty in
           let python_dict =
@@ -650,9 +652,9 @@ module Type = struct
           (index, python_args, python_dict),
           ((Labelled label, Metapp.Pat.var label),
             (Labelled label,
-              Ocaml_in_python_api.Function.apply arg_converter.ocaml_of_python
+              (fun () -> Ocaml_in_python_api.Function.apply arg_converter.ocaml_of_python
                 [%expr Py.Dict.find_string keywords_dict
-                  [%e Metapp.Exp.of_string label]]))
+                  [%e Metapp.Exp.of_string label]])))
       | Optional label ->
           let arg_converter =
             match param.ty with
@@ -664,12 +666,12 @@ module Type = struct
               Metapp.Exp.var label) :: python_dict in
           (index, python_args, python_dict),
           ((Optional label, Metapp.Pat.var label),
-            (Optional label, [%expr Option.map
+            (Optional label, (fun () -> [%expr Option.map
               [%e Ocaml_in_python_api.Function.to_expression arg_converter.ocaml_of_python]
                 (if keywords_dict = Py.null then None
                  else
                  Py.Dict.find_string_opt keywords_dict
-                   [%e Metapp.Exp.of_string label])])) in
+                   [%e Metapp.Exp.of_string label])]))) in
     let (_, python_args, python_dict), ocaml_args =
       List.fold_left_map add_arg (0, [], []) arity.params in
     let python_args = make_python_tuple (List.rev python_args) in
@@ -1611,11 +1613,13 @@ let make_type_converter (type_info : type_info) ocaml_env expansions params :
                 else
                   [%e raise_error]]
             | _ -> raise_error]];
-      index in
-  let python_of_ocaml = get_variable_ident python_of_ocaml converter_index in
-  let ocaml_of_python = get_variable_ident ocaml_of_python converter_index in {
-    python_of_ocaml = Ocaml_in_python_api.Function.Implicit (Metapp.Exp.ident python_of_ocaml);
-    ocaml_of_python = Ocaml_in_python_api.Function.Implicit (Metapp.Exp.ident ocaml_of_python)}
+      index in {
+    python_of_ocaml = Ocaml_in_python_api.Function.ImplicitDelayed (fun () ->
+      let python_of_ocaml = get_variable_ident python_of_ocaml converter_index in
+      Metapp.Exp.ident python_of_ocaml);
+    ocaml_of_python = Ocaml_in_python_api.Function.ImplicitDelayed (fun () ->
+      let ocaml_of_python = get_variable_ident ocaml_of_python converter_index in
+      Metapp.Exp.ident ocaml_of_python)}
 
 let add_type_converter (type_info : type_info) =
   let class_ = get_variable_expression type_info.class_var in

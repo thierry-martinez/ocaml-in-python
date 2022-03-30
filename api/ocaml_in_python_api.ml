@@ -66,16 +66,19 @@ let format_label (fmt : Format.formatter) (l : Ppxlib.arg_label) =
 module Function = struct
   type t =
     | Implicit of Ppxlib.expression
+    | ImplicitDelayed of (unit -> Ppxlib.expression)
     | Explicit of (Ppxlib.expression -> Ppxlib.expression)
 
   let apply (f : t) (e : Ppxlib.expression) =
     match f with
     | Implicit f -> [%expr [%e f] [%e e]]
+    | ImplicitDelayed f -> [%expr [%e f ()] [%e e]]
     | Explicit f -> f e
 
   let to_expression (f : t) =
     match f with
     | Implicit f -> f
+    | ImplicitDelayed f -> f ()
     | Explicit f -> [%expr fun v -> [%e f [%expr v]]]
 end
 
@@ -88,7 +91,7 @@ type converters_of_arity = {
     python_args : Ppxlib.expression;
     python_dict : Ppxlib.expression;
     ocaml_pats : (Ppxlib.arg_label * Ppxlib.pattern) list;
-    ocaml_exps : (Ppxlib.arg_label * Ppxlib.expression) list;
+    ocaml_exps : (Ppxlib.arg_label * (unit -> Ppxlib.expression)) list;
   }
 
 module Type = struct
