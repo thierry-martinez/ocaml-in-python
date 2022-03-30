@@ -20,7 +20,7 @@ Effortless Python bindings for OCaml modules
 ")
  (depends
   (ocaml (>= 4.13.0))
-  (ppxlib (>= 0.23.0))
+  (ppxlib (>= 0.26.0))
   (metapp (>= 0.4.3))
   (metaquot (>= 0.5.1))
   (pyml (>= 20220325))
