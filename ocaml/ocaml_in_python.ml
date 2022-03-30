@@ -323,11 +323,11 @@ let uid_of_type_lident ocaml_env (lident : Longident.t) =
     Ocaml_common.Env.lookup_type ~loc:Location.none lident ocaml_env in
   td.type_uid
 
-let import_ocaml_module_in_python_ref = ref (fun _ _ ->
+let import_ocaml_module_in_python_ref = ref (fun ?target_top_module:_ _ _ ->
   failwith "not available yet")
 
-let import_ocaml_module_in_python ocaml_env (expansions : Path.t Path.Map.t) =
-  !import_ocaml_module_in_python_ref ocaml_env expansions
+let import_ocaml_module_in_python ?target_top_module ocaml_env (expansions : Path.t Path.Map.t) =
+  !import_ocaml_module_in_python_ref ?target_top_module ocaml_env expansions
 
 module StringSet = Set.Make (String)
 
@@ -1823,14 +1823,20 @@ let add_record_type_info ocaml_env expansions _python_module (type_info : type_i
       (Py.Callable.of_function_as_tuple
         (Ocaml_in_python_api.api_for_type type_def_info))]
 
-let add_variant_type_info ocaml_env expansions python_module (type_info : type_info)
+let set_python_module ~target_top_module python_module key value =
+  let key_str = Metapp.Exp.of_string key in
+  push_structure [%str
+    Py.Module.set [%e python_module] [%e key_str] [%e value];
+    [%e if target_top_module then [%expr
+      Py.Module.set (Ocaml_in_python_api.get_root_python_module ())
+        [%e key_str] [%e value]]
+    else [%expr ()]]]
+
+let add_variant_type_info ~target_top_module ocaml_env expansions python_module (type_info : type_info)
       (constructors : _ Constructor.t list) =
   constructors |> List.iter (fun (info : _ Constructor.t) ->
-    push_structure
-      [%str Py.Module.set [%e python_module]
-        [%e Metapp.Exp.of_string info.name]
-        [%e Metapp.Exp.ident (get_variable_ident get_local_class_var info.class_var)]
-      ]);
+    set_python_module ~target_top_module python_module info.name
+      (Metapp.Exp.ident (get_variable_ident get_local_class_var info.class_var)));
   let table = Ocaml_in_python_api.TypeList.Hashtbl.create 16 in
   let type_of_params params =
     Ppxlib.Ast_helper.Typ.constr
@@ -2254,20 +2260,16 @@ let add_open_type_info ocaml_env expansions _python_module (type_info : type_inf
       api_table };
   type_info.capsule_var <- capsule_var
 
-let add_type_info ocaml_env expansions python_module (type_info : type_info) =
+let add_type_info ?(target_top_module=false) ocaml_env expansions python_module (type_info : type_info) =
   let class_var = get_variable get_local_class_var type_info.class_var in
-  push_structure
-    [%str Py.Module.set [%e python_module]
-      [%e Metapp.Exp.of_string type_info.name]
-      [%e class_var]
-    ];
+  set_python_module ~target_top_module python_module type_info.name class_var;
   match type_info.kind with
   | Abstract ->
       add_abstract_type_info ocaml_env expansions python_module type_info
   | Record labels ->
       add_record_type_info ocaml_env expansions python_module type_info labels
   | Variant cstrs ->
-      add_variant_type_info ocaml_env expansions python_module type_info cstrs
+      add_variant_type_info ~target_top_module ocaml_env expansions python_module type_info cstrs
   | Open cstrs ->
       add_open_type_info ocaml_env expansions python_module type_info cstrs
 
@@ -2387,6 +2389,7 @@ let polymorphic_function_converter ~name ocaml_env expansions (vars : Type.Vars.
 
 let python_module_count = ref 0
 
+(*
 let postpone value = [%expr
   Py.Callable.to_function_as_tuple (Py.Class.init "postponed"
     ~fields:["computed", Py.Bool.f; "value", Py.none]
@@ -2402,6 +2405,11 @@ let postpone value = [%expr
               Py.Object.set_attr_string self "value" value;
               value
             end)]) Py.Tuple.empty]
+*)
+
+let postpone value =
+  make_property ~getter:[%expr Py.Callable.of_function_as_tuple (fun _ ->
+    [%e value])] ()
 
 let add_type_declaration_expansion ?orig_path path expansions (ident, _) =
   let name = Ident.name ident in
@@ -2433,31 +2441,26 @@ and add_signature_item_expansions orig_path path expansions
       add_module_declaration_expansions orig_path' path' expansions decl
   | _ -> expansions
 
-let add_type_manifest ocaml_env expansions python_module (ident, (decl : Types.type_declaration), (manifest : Types.type_expr)) =
+let add_type_manifest ~target_top_module ocaml_env expansions python_module (ident, (decl : Types.type_declaration), (manifest : Types.type_expr)) =
   match Metapp.Types.get_desc manifest with
   | Tconstr (path, _args, _) ->
       begin match type_info_of_constr ocaml_env expansions path with
       | None -> ()
       | Some type_info ->
-          push_structure
-            [%str Py.Module.set [%e python_module]
-              [%e Metapp.Exp.of_string (Ident.name ident)]
-              [%e get_variable_as_expression get_local_class_var type_info.class_]
-            ];
+          set_python_module ~target_top_module python_module (Ident.name ident)
+            (get_variable_as_expression get_local_class_var type_info.class_);
           match decl.type_kind with
           | Type_variant (constructors, _) ->
               constructors |> List.iter (fun (cstr : Types.constructor_declaration) ->
                 let name = Ident.name cstr.cd_id in
                 let s = Metapp.Exp.of_string name in
-                push_structure
-                  [%str Py.Module.set [%e python_module] [%e s]
-                    (Py.Object.find_attr_string [%e get_variable_as_expression get_local_class_var type_info.class_] [%e s])
-                  ])
+                set_python_module ~target_top_module python_module name
+                  [%expr Py.Object.find_attr_string [%e get_variable_as_expression get_local_class_var type_info.class_] [%e s]])
           | _ -> ()
       end
   | _ -> ()
 
-let rec convert_signature_items ocaml_env expansions longident path python_module
+let rec convert_signature_items ~target_top_module ocaml_env expansions longident path python_module
       (list : Types.signature_item list) =
   match list with
   | [] -> ()
@@ -2487,9 +2490,7 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
                 polymorphic_function_converter ~name ocaml_env expansions vars ty ident
             | _ ->
                 failwith "Polymorphic values are not supported" in
-        push_structure [%str
-          Py.Module.set [%e python_module] [%e Metapp.Exp.of_string name]
-            [%e expr]]
+        set_python_module ~target_top_module python_module name expr
       with exc ->
         if !debug then
           let format_exc fmt exc =
@@ -2499,7 +2500,7 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
           Format.eprintf "Warning: %a not available: %a@."
             Pprintast.longident longident' format_exc exc
       end;
-      convert_signature_items ocaml_env expansions longident path python_module tail
+      convert_signature_items ~target_top_module ocaml_env expansions longident path python_module tail
   | Sig_type (ident, type_declaration, rec_status, _visibility) :: tail ->
       let type_declarations = [ident, type_declaration] in
       let type_declarations, tail =
@@ -2518,22 +2519,19 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
       begin
         let name = Ident.name ident in
         if name = "t" && longident = Ldot (Lident "Stdlib", "List") then
-          begin
-            push_structure [%str
-              Py.Module.set [%e python_module] "t"
-                (Py.Object.find_attr_string
-                  (Ocaml_in_python_api.get_root_python_module ()) "list")]
-          end
+          set_python_module ~target_top_module python_module "t"
+            [%expr Py.Object.find_attr_string
+              (Ocaml_in_python_api.get_root_python_module ()) "list"]
         else if name = "t" && longident = Ldot (Lident "Stdlib", "Option") then
           begin
-            push_structure [%str
-              Py.Module.set [%e python_module] "t"
-                (Py.Object.find_attr_string
-                  (Ocaml_in_python_api.get_root_python_module ()) "option");
-              Py.Module.set [%e python_module] "None" Py.none;
-              Py.Module.set [%e python_module] "Some"
-                (Py.Object.find_attr_string
-                  (Ocaml_in_python_api.get_root_python_module ()) "Some")]
+            set_python_module ~target_top_module python_module "t"
+              [%expr Py.Object.find_attr_string
+                (Ocaml_in_python_api.get_root_python_module ()) "option"];
+            set_python_module ~target_top_module python_module "None"
+              [%expr Py.none];
+            set_python_module ~target_top_module python_module "Some"
+              [%expr Py.Object.find_attr_string
+                (Ocaml_in_python_api.get_root_python_module ()) "Some"]
           end
         else
           let type_declarations =
@@ -2553,10 +2551,10 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
           let type_infos =
             List.map (add_class_prototype longident) type_declarations in
           List.iter add_type_converter type_infos;
-          List.iter (add_type_info ocaml_env expansions python_module) type_infos;
-          List.iter (add_type_manifest ocaml_env expansions python_module) type_manifests;
+          List.iter (add_type_info ~target_top_module ocaml_env expansions python_module) type_infos;
+          List.iter (add_type_manifest ~target_top_module ocaml_env expansions python_module) type_manifests;
       end;
-      convert_signature_items ocaml_env expansions' longident path python_module tail
+      convert_signature_items ~target_top_module ocaml_env expansions' longident path python_module tail
   | Sig_typext (ident, ext, _status, _visibility) :: tail ->
       let name = Ident.name ident in
       let longident' : Longident.t = Ldot (longident, name) in
@@ -2570,9 +2568,8 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
         Type.of_type_expr vars ocaml_env expansions ty) in
       let index = Ocaml_in_python_api.ExtensibleArray.push open_type.constructors (Some cstr) in
       push_constructor_class longident' class_var (fun (longident : Longident.t) -> Format.asprintf "%a" Pprintast.longident longident) index cstr;
-      push_structure [%str
-        Py.Module.set [%e python_module] [%e Metapp.Exp.of_string name]
-          [%e Metapp.Exp.var (get_local_class_var cstr.class_var.local_index)]];
+      set_python_module ~target_top_module python_module name
+        (Metapp.Exp.var (get_local_class_var cstr.class_var.local_index));
       push_structure [%str
         let type_def_info =
           Ocaml_in_python_api.IntHashtbl.find Ocaml_in_python_api.OpenType.table
@@ -2584,7 +2581,7 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
                 let api =
                   Ocaml_in_python_api.api_for_type type_def_info tuple in
                api.([%e Metapp.Exp.of_int index])))];
-      convert_signature_items ocaml_env expansions longident path python_module tail
+      convert_signature_items ~target_top_module ocaml_env expansions longident path python_module tail
   | Sig_module (ident, _presence, decl, _rec, _visibility) :: tail ->
       let name = Ident.name ident in
       let longident' = Longident.Ldot (longident, name) in
@@ -2606,18 +2603,19 @@ let rec convert_signature_items ocaml_env expansions longident path python_modul
           let index =
             Ocaml_in_python_api.ExtensibleArray.push
               Ocaml_in_python_api.pending_modules l in
-          push_structure [%str
-            Py.Module.set [%e python_module] [%e Metapp.Exp.of_string name] [%e
-              postpone [%expr Lazy.force (Ocaml_in_python_api.ExtensibleArray.get
-                Ocaml_in_python_api.pending_modules [%e Metapp.Exp.of_int index])]]];
+          let value =
+            [%expr Lazy.force (Ocaml_in_python_api.ExtensibleArray.get
+               Ocaml_in_python_api.pending_modules [%e Metapp.Exp.of_int index])] in
+          let value = postpone value in
+          set_python_module ~target_top_module:false python_module name value
         end;
       let expansions' =
         add_module_declaration_expansions (Path.Pident ident) path' expansions decl in
-      convert_signature_items ocaml_env expansions' longident path python_module tail
+      convert_signature_items ~target_top_module ocaml_env expansions' longident path python_module tail
   | _ :: tail ->
-      convert_signature_items ocaml_env expansions longident path python_module tail
+      convert_signature_items ~target_top_module ocaml_env expansions longident path python_module tail
 
-and convert_signature ocaml_env expansions longident path path_index signature =
+and convert_signature ~target_top_module ocaml_env expansions longident path path_index signature =
   let python_module_index = count python_module_count in
   let python_module_var =
     Printf.sprintf "python_module%d" python_module_index in
@@ -2626,12 +2624,12 @@ and convert_signature ocaml_env expansions longident path path_index signature =
       Ocaml_in_python_api.Paths.path_cell =
       Ocaml_in_python_api.Paths.get [%e Metapp.Exp.of_int path_index]];
   let python_module = Metapp.Exp.var python_module_var in
-  convert_signature_items ocaml_env expansions longident path
+  convert_signature_items ~target_top_module ocaml_env expansions longident path
     python_module signature;
   pop_preample ();
   cut_compilation ()
 
-and python_of_module_declaration ocaml_env expansions longident path
+and python_of_module_declaration ?(target_top_module = false) ocaml_env expansions longident path
     (moddecl : Types.module_declaration) =
   match Ocaml_in_python_api.Paths.find_opt path with
   | Some _ as result -> result
@@ -2643,22 +2641,23 @@ and python_of_module_declaration ocaml_env expansions longident path
           let root = prepare_compilation_opt () in
           let ocaml_env' = Ocaml_common.Env.add_signature signature ocaml_env in
           let class_ = Py.Class.init (Path.name path) in
+          let instance_ = Py.Callable.to_function class_ [| |] in
           let index = Ocaml_in_python_api.Paths.register path class_ in
-          convert_signature ocaml_env' expansions longident path index
+          convert_signature ~target_top_module ocaml_env' expansions longident path index
             signature;
           catch_compiler_errors (fun () ->
             Option.iter (fun _ -> perform_compilation ()) root);
-          Some { index; class_ }
+          Some { index; class_ = instance_ }
       | Mty_functor _ ->
           None
       | Mty_alias path ->
-          python_of_module_path ocaml_env expansions longident path
+          python_of_module_path ~target_top_module ocaml_env expansions longident path
 
-and python_of_module_path ocaml_env expansions longident path =
+and python_of_module_path ?target_top_module ocaml_env expansions longident path =
   let moddecl = Ocaml_common.Env.find_module path ocaml_env in
-  python_of_module_declaration ocaml_env expansions longident path moddecl
+  python_of_module_declaration ?target_top_module ocaml_env expansions longident path moddecl
 
-let python_of_module_name ocaml_env expansions name =
+let python_of_module_name ?target_top_module ocaml_env expansions name =
   if name = "Stdlib__Lexing" || name = "CamlinternalOO" then
     None
   else
@@ -2666,7 +2665,7 @@ let python_of_module_name ocaml_env expansions name =
   let path, moddecl =
     Ocaml_common.Env.lookup_module ~loc:!Ppxlib.Ast_helper.default_loc
       longident ocaml_env in
-  python_of_module_declaration ocaml_env expansions longident path moddecl
+  python_of_module_declaration ?target_top_module ocaml_env expansions longident path moddecl
 
 let value_converter_of_bytes : Ocaml_in_python_api.value_converter = {
   ocaml_of_python = Explicit (fun v -> [%expr
@@ -2686,10 +2685,10 @@ let value_converter_of_bytes : Ocaml_in_python_api.value_converter = {
         "__capsule", fst Ocaml_in_python_api.bytes_capsule [%e v];])]); }
 
 let () =
-  import_ocaml_module_in_python_ref := (fun ocaml_env (expansions : Path.t Path.Map.t) name ->
+  import_ocaml_module_in_python_ref := (fun ?target_top_module ocaml_env (expansions : Path.t Path.Map.t) name ->
     catch_compiler_errors (fun () ->
     let ({ class_; index = _ } : Ocaml_in_python_api.Paths.index_cell) =
-      Option.get (python_of_module_name ocaml_env expansions name) in
+      Option.get (python_of_module_name ?target_top_module ocaml_env expansions name) in
     let ocaml = Ocaml_in_python_api.get_root_python_module () in
     Py.Module.set ocaml name class_;
     class_))
@@ -2913,11 +2912,10 @@ let initialize_python ocaml_env =
     class_ = Left [%expr Py.Object.find_attr_string Py.none "__class__"]};
   Type.value_converter_of_tuple := value_converter_of_tuple;
   let stdlib =
-    import_ocaml_module_in_python ocaml_env Path.Map.empty "Stdlib" in
+    import_ocaml_module_in_python ~target_top_module:true ocaml_env
+      Path.Map.empty "Stdlib" in
   register_primitive "__getattr__" (fun tuple ->
     let name = Py.String.to_string (Py.Tuple.get tuple 0) in
-    if name = "" then
-      raise (Py.Err (AttributeError, "Invalid empty name"));
     try Py.Object.find_attr_string stdlib name
     with Not_found | Py.E _ ->
       import_ocaml_module_in_python ocaml_env Path.Map.empty name)
